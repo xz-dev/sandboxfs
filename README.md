@@ -116,6 +116,16 @@ sandboxfs demo monitor -f
 
 `monitor` prints the recent log tail; `monitor -f` starts at the same tail and follows new log entries. Logs are reset when `sandboxfs run <name>` starts and are removed when the sandbox is destroyed.
 
+Audit log entries use filesystem-operation vocabulary rather than shell command reconstruction. Every entry has a UTC microsecond timestamp and its own event ID, for example:
+
+```text
+[2026-06-29T13:55:12.123456Z] id=3 pending path=/data/file.txt SETATTR mode=0600
+[2026-06-29T13:55:13.000042Z] id=4 decision request=3 ALLOW
+[2026-06-29T13:55:14.999999Z] id=5 trusted path=/data/file.txt SETATTR mode=0444
+```
+
+The log writer is a serialized event loop. FUSE and control paths publish events to it instead of appending directly from concurrent call sites.
+
 ## Runtime paths
 
 - `SANDBOXFS_RUNTIME_DIR` overrides the runtime directory.
