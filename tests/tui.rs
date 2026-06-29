@@ -36,7 +36,7 @@ fn tui_renders_pending_request_and_controls() {
         pid: 123,
         uid: 1000,
         gid: 1000,
-        description: "chmod 444 /data/file".to_string(),
+        description: "path=/data/file SETATTR mode=0444".to_string(),
     }];
     let backend = TestBackend::new(80, 12);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -45,7 +45,7 @@ fn tui_renders_pending_request_and_controls() {
         .unwrap();
     let rendered = buffer_text(terminal.backend().buffer());
     assert!(rendered.contains("Operation"));
-    assert!(rendered.contains("42 chmod 444 /data/file"));
+    assert!(rendered.contains("42 path=/data/file SETATTR mode=0444"));
     assert!(rendered.contains("a=allow d=deny n=do-nothing e=edit q=quit ok"));
 }
 

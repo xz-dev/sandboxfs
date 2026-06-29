@@ -29,18 +29,41 @@ const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
 pub struct SandboxFs {
     pub sandbox_name: String,
     pub registry: Arc<Mutex<SandboxRegistry>>,
+    log_writer: log::LogWriterHandle,
     inodes: Arc<Mutex<HashMap<u64, SandboxPath>>>,
     handles: Arc<Mutex<HashMap<u64, PathBuf>>>,
     next_handle: Arc<Mutex<u64>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RequestIdentity {
+    pid: u32,
+    uid: u32,
+    gid: u32,
+}
+
+impl RequestIdentity {
+    fn from_request(req: &Request) -> Self {
+        Self {
+            pid: req.pid(),
+            uid: req.uid(),
+            gid: req.gid(),
+        }
+    }
+}
+
 impl SandboxFs {
-    pub fn new(sandbox_name: impl Into<String>, registry: Arc<Mutex<SandboxRegistry>>) -> Self {
+    pub fn new(
+        sandbox_name: impl Into<String>,
+        registry: Arc<Mutex<SandboxRegistry>>,
+        log_writer: log::LogWriterHandle,
+    ) -> Self {
         let mut inodes = HashMap::new();
         inodes.insert(1, SandboxPath::root());
         Self {
             sandbox_name: sandbox_name.into(),
             registry,
+            log_writer,
             inodes: Arc::new(Mutex::new(inodes)),
             handles: Arc::new(Mutex::new(HashMap::new())),
             next_handle: Arc::new(Mutex::new(1)),
@@ -111,19 +134,68 @@ impl SandboxFs {
         path: SandboxPath,
         operation: MetadataOperation,
     ) -> std::result::Result<FileAttr, Errno> {
+        self.create_pending_or_apply_for_identity(
+            RequestIdentity::from_request(req),
+            path,
+            operation,
+        )
+    }
+
+    fn create_pending_or_apply_for_identity(
+        &self,
+        identity: RequestIdentity,
+        path: SandboxPath,
+        operation: MetadataOperation,
+    ) -> std::result::Result<FileAttr, Errno> {
         let unchanged_attr = self.attr_for_path(&path)?;
         let mut registry = self.registry.lock().unwrap();
-        let trusted =
-            Self::is_trusted_operation(&registry, &self.sandbox_name, req.pid(), req.uid(), &path);
+        let trusted = Self::is_trusted_operation(
+            &registry,
+            &self.sandbox_name,
+            identity.pid,
+            identity.uid,
+            &path,
+        );
         if trusted {
+            let log_path = {
+                let sandbox = registry
+                    .sandboxes
+                    .get(&self.sandbox_name)
+                    .ok_or(Errno::ENOENT)?;
+                if sandbox.resolve(operation.path()).is_none() {
+                    return Err(Errno::ENOTSUP);
+                }
+                sandbox.log_path.clone()
+            };
+            let id = registry.next_operation_id();
+            let trusted_id = registry
+                .trusted
+                .values()
+                .find(|op| {
+                    op.sandbox == self.sandbox_name
+                        && op.pid == Some(identity.pid)
+                        && op.uid == Some(identity.uid)
+                        && op.paths.iter().any(|scope| {
+                            if scope.recursive {
+                                path.starts_with(&scope.path)
+                            } else {
+                                path == scope.path
+                            }
+                        })
+                })
+                .map(|op| op.id);
+            let body = if let Some(trusted_id) = trusted_id {
+                format!("trusted trusted={trusted_id} {}", operation.event_body())
+            } else {
+                format!("trusted {}", operation.event_body())
+            };
+            self.log_writer
+                .append(&log_path, log::format_log_line(id, &body))
+                .map_err(|_| Errno::EIO)?;
             let sandbox = registry
                 .sandboxes
                 .get_mut(&self.sandbox_name)
                 .ok_or(Errno::ENOENT)?;
-            if sandbox.resolve(operation.path()).is_none() {
-                return Err(Errno::ENOTSUP);
-            }
-            log::append_log(&sandbox.log_path, operation.description()).map_err(|_| Errno::EIO)?;
             sandbox
                 .apply_metadata_override(&operation)
                 .map_err(|_| Errno::ENOTSUP)?;
@@ -132,23 +204,28 @@ impl SandboxFs {
         }
 
         let id = registry.next_operation_id();
-        let description = operation.description();
+        let description = operation.event_body();
         let log_path = registry
             .sandboxes
             .get(&self.sandbox_name)
             .map(|s| s.log_path.clone())
             .ok_or(Errno::ENOENT)?;
         let waiter: PendingWaiter = Arc::new((Mutex::new(None), Condvar::new()));
-        log::append_log(&log_path, format!("{id} {description}")).map_err(|_| Errno::EIO)?;
+        self.log_writer
+            .append(
+                &log_path,
+                log::format_log_line(id, &format!("pending {description}")),
+            )
+            .map_err(|_| Errno::EIO)?;
         registry.pending.insert(
             id,
             crate::state::PendingMetadataRequest {
                 id,
                 sandbox: self.sandbox_name.clone(),
                 operation: operation.clone(),
-                pid: req.pid(),
-                uid: req.uid(),
-                gid: req.gid(),
+                pid: identity.pid,
+                uid: identity.uid,
+                gid: identity.gid,
                 description: description.clone(),
             },
         );
@@ -526,5 +603,149 @@ impl OsStrBytes for OsStr {
     fn as_bytes(&self) -> &[u8] {
         use std::os::unix::ffi::OsStrExt;
         OsStrExt::as_bytes(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use tempfile::TempDir;
+
+    use crate::state::{Sandbox, TrustedOperation, TrustedPathScope};
+
+    fn registry_with_file(temp: &TempDir, log_path: PathBuf) -> Arc<Mutex<SandboxRegistry>> {
+        let local = temp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("file"), "hello").unwrap();
+        std::fs::set_permissions(local.join("file"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+
+        let mut sandbox = Sandbox::new("demo", log_path);
+        sandbox.add_layer(local, SandboxPath::new("/data").unwrap());
+
+        let registry = Arc::new(Mutex::new(SandboxRegistry::new()));
+        registry
+            .lock()
+            .unwrap()
+            .sandboxes
+            .insert("demo".to_string(), sandbox);
+        registry
+    }
+
+    fn wait_for_pending(registry: &Arc<Mutex<SandboxRegistry>>) -> u64 {
+        let start = Instant::now();
+        loop {
+            if let Some(id) = registry.lock().unwrap().pending.keys().next().copied() {
+                return id;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "pending operation did not appear"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn untrusted_metadata_request_logs_pending_event() {
+        let temp = TempDir::new().unwrap();
+        let log_path = temp.path().join("logs/demo.log");
+        let registry = registry_with_file(&temp, log_path.clone());
+        let writer = log::LogWriter::new();
+        let fs = SandboxFs::new("demo", Arc::clone(&registry), writer.handle());
+        let path = SandboxPath::new("/data/file").unwrap();
+
+        let worker = {
+            let fs = fs.clone();
+            let path = path.clone();
+            thread::spawn(move || {
+                fs.create_pending_or_apply_for_identity(
+                    RequestIdentity {
+                        pid: 123,
+                        uid: 1000,
+                        gid: 1000,
+                    },
+                    path.clone(),
+                    MetadataOperation::Chmod { path, mode: 0o444 },
+                )
+            })
+        };
+
+        let id = wait_for_pending(&registry);
+        let data = log::read_log(&log_path).unwrap();
+        assert!(data.contains(&format!(
+            " id={id} pending path=/data/file SETATTR mode=0444"
+        )));
+
+        let waiter = {
+            let mut registry = registry.lock().unwrap();
+            registry.pending.remove(&id);
+            registry.pending_waiters.remove(&id).unwrap()
+        };
+        let (lock, cvar) = &*waiter;
+        *lock.lock().unwrap() = Some(PendingDecision::DoNothing);
+        cvar.notify_all();
+
+        let attr = worker.join().unwrap().unwrap();
+        assert_eq!(attr.perm, 0o644);
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn trusted_metadata_request_logs_trusted_event_without_host_mutation() {
+        let temp = TempDir::new().unwrap();
+        let log_path = temp.path().join("logs/demo.log");
+        let registry = registry_with_file(&temp, log_path.clone());
+        {
+            let mut registry = registry.lock().unwrap();
+            registry.trusted.insert(
+                "token".to_string(),
+                TrustedOperation {
+                    id: 42,
+                    sandbox: "demo".to_string(),
+                    token: "token".to_string(),
+                    pid: Some(123),
+                    uid: Some(1000),
+                    mountpoint: temp.path().join("mnt"),
+                    command: "chmod".to_string(),
+                    paths: vec![TrustedPathScope {
+                        path: SandboxPath::new("/data/file").unwrap(),
+                        recursive: false,
+                    }],
+                },
+            );
+        }
+        let writer = log::LogWriter::new();
+        let fs = SandboxFs::new("demo", Arc::clone(&registry), writer.handle());
+        let path = SandboxPath::new("/data/file").unwrap();
+
+        let attr = fs
+            .create_pending_or_apply_for_identity(
+                RequestIdentity {
+                    pid: 123,
+                    uid: 1000,
+                    gid: 1000,
+                },
+                path.clone(),
+                MetadataOperation::Chmod { path, mode: 0o444 },
+            )
+            .unwrap();
+
+        assert_eq!(attr.perm, 0o444);
+        let data = log::read_log(&log_path).unwrap();
+        assert!(data.contains(" id=1 trusted trusted=42 path=/data/file SETATTR mode=0444"));
+        assert_eq!(
+            std::fs::metadata(temp.path().join("local/file"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        writer.shutdown().unwrap();
     }
 }

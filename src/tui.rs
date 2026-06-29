@@ -97,7 +97,7 @@ where
                 }
                 KeyCode::Char('e') => {
                     if let Some(p) = pending.get(selected) {
-                        message = edit_pending_command(name, p.id, &p.description)?;
+                        message = edit_pending_command(name, p.id, &p.operation.shell_hint())?;
                     }
                 }
                 _ => {}

@@ -35,14 +35,28 @@ pub struct SessionState {
     pub registry: Arc<Mutex<SandboxRegistry>>,
     pub runtime: RuntimePaths,
     pub mounts: Mutex<Vec<MountedSession>>,
+    pub log_writer: log::LogWriterHandle,
+    _log_writer: Option<log::LogWriter>,
 }
 
 impl SessionState {
     pub fn new(runtime: RuntimePaths) -> Self {
+        let log_writer = log::LogWriter::new();
+        let log_writer_handle = log_writer.handle();
+        Self::with_log_writer(runtime, log_writer_handle, Some(log_writer))
+    }
+
+    fn with_log_writer(
+        runtime: RuntimePaths,
+        log_writer: log::LogWriterHandle,
+        owned_log_writer: Option<log::LogWriter>,
+    ) -> Self {
         Self {
             registry: Arc::new(Mutex::new(SandboxRegistry::new())),
             runtime,
             mounts: Mutex::new(Vec::new()),
+            log_writer,
+            _log_writer: owned_log_writer,
         }
     }
 
@@ -55,7 +69,7 @@ impl SessionState {
     fn create_initial(&self, name: &str) -> Result<()> {
         validate_name(name)?;
         let log_path = self.runtime.sandbox_log_path(name);
-        log::reset_log(&log_path)?;
+        self.log_writer.reset(&log_path)?;
         let mut registry = self.registry.lock().unwrap();
         registry
             .sandboxes
@@ -146,7 +160,7 @@ impl SessionState {
         let Some(sandbox) = registry.sandboxes.remove(name) else {
             return Ok(Response::Ok);
         };
-        log::remove_log(&sandbox.log_path)?;
+        self.log_writer.remove(&sandbox.log_path)?;
         Ok(Response::Ok)
     }
 
@@ -173,7 +187,11 @@ impl SessionState {
             }
         }
 
-        let fs = SandboxFs::new(name.to_string(), Arc::clone(&self.registry));
+        let fs = SandboxFs::new(
+            name.to_string(),
+            Arc::clone(&self.registry),
+            self.log_writer.clone(),
+        );
         let mut config = Config::default();
         config.mount_options = vec![
             MountOption::FSName(format!("sandboxfs:{name}")),
@@ -246,20 +264,22 @@ impl SessionState {
             )));
         }
         let mut registry = self.registry.lock().unwrap();
+        let id = registry.next_operation_id();
         let sandbox = registry
             .sandboxes
             .get_mut(name)
             .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
         sandbox.add_layer(local.clone(), on_fs.clone());
-        log::append_log(
+        self.log_writer.append(
             &sandbox.log_path,
-            format!("add {} on {}", local.display(), on_fs),
+            log::format_log_line(id, &format!("mount local={} path={on_fs}", local.display())),
         )?;
         Ok(Response::Ok)
     }
 
     fn umount_layer(&self, name: &str, on_fs: &SandboxPath) -> Result<Response> {
         let mut registry = self.registry.lock().unwrap();
+        let id = registry.next_operation_id();
         let sandbox = registry
             .sandboxes
             .get_mut(name)
@@ -267,18 +287,25 @@ impl SessionState {
         if !sandbox.remove_layer(on_fs) {
             return Err(Error::msg(format!("no mount at {on_fs}")));
         }
-        log::append_log(&sandbox.log_path, format!("del {on_fs}"))?;
+        self.log_writer.append(
+            &sandbox.log_path,
+            log::format_log_line(id, &format!("umount path={on_fs}")),
+        )?;
         Ok(Response::Ok)
     }
 
     fn hide(&self, name: &str, on_fs: SandboxPath) -> Result<Response> {
         let mut registry = self.registry.lock().unwrap();
+        let id = registry.next_operation_id();
         let sandbox = registry
             .sandboxes
             .get_mut(name)
             .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
         sandbox.add_hide(on_fs.clone());
-        log::append_log(&sandbox.log_path, format!("hide {on_fs}"))?;
+        self.log_writer.append(
+            &sandbox.log_path,
+            log::format_log_line(id, &format!("hide path={on_fs}")),
+        )?;
         Ok(Response::Ok)
     }
 
@@ -402,7 +429,14 @@ impl SessionState {
                 "pending operation {id} does not belong to sandbox {name}"
             )));
         }
+        let decision_id = registry.next_operation_id();
         let waiter = registry.pending_waiters.remove(&id);
+        let log_path = registry
+            .sandboxes
+            .get(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?
+            .log_path
+            .clone();
         if waiter.is_none() && !do_nothing {
             let sandbox = registry
                 .sandboxes
@@ -410,15 +444,29 @@ impl SessionState {
                 .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
             sandbox.apply_metadata_override(&pending.operation)?;
         }
-        if let Some(waiter) = waiter {
-            let (lock, cvar) = &*waiter;
-            *lock.lock().unwrap() = Some(if do_nothing {
+        let log_result = self.log_writer.append(
+            &log_path,
+            log::format_log_line(
+                decision_id,
+                &format!(
+                    "decision request={id} {}",
+                    if do_nothing {
+                        "ALLOW_DO_NOTHING"
+                    } else {
+                        "ALLOW"
+                    }
+                ),
+            ),
+        );
+        notify_pending_waiter(
+            waiter,
+            if do_nothing {
                 PendingDecision::DoNothing
             } else {
                 PendingDecision::Apply
-            });
-            cvar.notify_all();
-        }
+            },
+        );
+        log_result?;
         Ok(Response::Ok)
     }
 
@@ -434,11 +482,20 @@ impl SessionState {
                 "pending operation {id} does not belong to sandbox {name}"
             )));
         }
-        if let Some(waiter) = registry.pending_waiters.remove(&id) {
-            let (lock, cvar) = &*waiter;
-            *lock.lock().unwrap() = Some(PendingDecision::Deny);
-            cvar.notify_all();
-        }
+        let decision_id = registry.next_operation_id();
+        let log_path = registry
+            .sandboxes
+            .get(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?
+            .log_path
+            .clone();
+        let waiter = registry.pending_waiters.remove(&id);
+        let log_result = self.log_writer.append(
+            &log_path,
+            log::format_log_line(decision_id, &format!("decision request={id} DENY")),
+        );
+        notify_pending_waiter(waiter, PendingDecision::Deny);
+        log_result?;
         Ok(Response::Ok)
     }
 
@@ -564,6 +621,14 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn notify_pending_waiter(waiter: Option<crate::state::PendingWaiter>, decision: PendingDecision) {
+    if let Some(waiter) = waiter {
+        let (lock, cvar) = &*waiter;
+        *lock.lock().unwrap() = Some(decision);
+        cvar.notify_all();
+    }
+}
+
 fn canonicalize_existing_dir(path: &Path) -> Result<PathBuf> {
     let canonical = fs::canonicalize(path)?;
     if !canonical.is_dir() {
@@ -621,5 +686,147 @@ mod tests {
             Response::Error { message } => assert!(message.contains("sandbox not found")),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn allow_notifies_waiter_even_if_decision_log_fails() {
+        let (session, waiter) = session_with_stopped_writer_and_pending_request();
+
+        match session.handle(Request::Allow {
+            name: "a".to_string(),
+            id: 1,
+            do_nothing: true,
+        }) {
+            Response::Error { message } => assert!(message.contains("log writer stopped")),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        assert_waiter_decision(&waiter, PendingDecision::DoNothing);
+        assert_no_pending_request(&session);
+    }
+
+    #[test]
+    fn deny_notifies_waiter_even_if_decision_log_fails() {
+        let (session, waiter) = session_with_stopped_writer_and_pending_request();
+
+        match session.handle(Request::Deny {
+            name: "a".to_string(),
+            id: 1,
+        }) {
+            Response::Error { message } => assert!(message.contains("log writer stopped")),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        assert_waiter_decision(&waiter, PendingDecision::Deny);
+        assert_no_pending_request(&session);
+    }
+
+    #[test]
+    fn allow_logs_fresh_decision_id_and_request_id() {
+        let (_temp, session, _writer, waiter) = session_with_pending_request_and_writer();
+
+        match session.handle(Request::Allow {
+            name: "a".to_string(),
+            id: 1,
+            do_nothing: false,
+        }) {
+            Response::Ok => {}
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let data = log::read_log(&session.runtime.sandbox_log_path("a")).unwrap();
+        assert!(data.contains(" id=2 decision request=1 ALLOW"));
+        assert_waiter_decision(&waiter, PendingDecision::Apply);
+    }
+
+    #[test]
+    fn allow_do_nothing_logs_fresh_decision_id_and_request_id() {
+        let (_temp, session, _writer, waiter) = session_with_pending_request_and_writer();
+
+        match session.handle(Request::Allow {
+            name: "a".to_string(),
+            id: 1,
+            do_nothing: true,
+        }) {
+            Response::Ok => {}
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let data = log::read_log(&session.runtime.sandbox_log_path("a")).unwrap();
+        assert!(data.contains(" id=2 decision request=1 ALLOW_DO_NOTHING"));
+        assert_waiter_decision(&waiter, PendingDecision::DoNothing);
+    }
+
+    #[test]
+    fn deny_logs_fresh_decision_id_and_request_id() {
+        let (_temp, session, _writer, waiter) = session_with_pending_request_and_writer();
+
+        match session.handle(Request::Deny {
+            name: "a".to_string(),
+            id: 1,
+        }) {
+            Response::Ok => {}
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let data = log::read_log(&session.runtime.sandbox_log_path("a")).unwrap();
+        assert!(data.contains(" id=2 decision request=1 DENY"));
+        assert_waiter_decision(&waiter, PendingDecision::Deny);
+    }
+
+    fn session_with_stopped_writer_and_pending_request()
+    -> (SessionState, crate::state::PendingWaiter) {
+        let (_temp, session, writer, waiter) = session_with_pending_request_and_writer();
+        writer.shutdown().unwrap();
+        (session, waiter)
+    }
+
+    fn session_with_pending_request_and_writer() -> (
+        TempDir,
+        SessionState,
+        log::LogWriter,
+        crate::state::PendingWaiter,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let runtime = RuntimePaths::for_tests(temp.path().to_path_buf(), None);
+        let writer = log::LogWriter::new();
+        let writer_handle = writer.handle();
+        let session = SessionState::with_log_writer(runtime, writer_handle, None);
+        session.create_initial("a").unwrap();
+
+        let waiter: crate::state::PendingWaiter =
+            Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+        {
+            let mut registry = session.registry.lock().unwrap();
+            registry.next_operation_id = 2;
+            registry.pending.insert(
+                1,
+                crate::state::PendingMetadataRequest {
+                    id: 1,
+                    sandbox: "a".to_string(),
+                    operation: crate::state::MetadataOperation::Chmod {
+                        path: SandboxPath::new("/data/file").unwrap(),
+                        mode: 0o444,
+                    },
+                    pid: 123,
+                    uid: 1000,
+                    gid: 1000,
+                    description: "path=/data/file SETATTR mode=0444".to_string(),
+                },
+            );
+            registry.pending_waiters.insert(1, Arc::clone(&waiter));
+        }
+        (temp, session, writer, waiter)
+    }
+
+    fn assert_waiter_decision(waiter: &crate::state::PendingWaiter, decision: PendingDecision) {
+        let (lock, _cvar) = &**waiter;
+        assert_eq!(*lock.lock().unwrap(), Some(decision));
+    }
+
+    fn assert_no_pending_request(session: &SessionState) {
+        let registry = session.registry.lock().unwrap();
+        assert!(!registry.pending.contains_key(&1));
+        assert!(!registry.pending_waiters.contains_key(&1));
     }
 }

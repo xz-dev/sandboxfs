@@ -79,9 +79,28 @@ impl MetadataOperation {
     }
 
     pub fn description(&self) -> String {
+        self.event_body()
+    }
+
+    pub fn event_body(&self) -> String {
+        match self {
+            Self::Chmod { path, mode } => format!("path={path} SETATTR mode={mode:04o}"),
+            Self::Chown { path, uid, gid } => format_setattr_body(path, None, *uid, *gid, None),
+            Self::Chattr { path, flags } => format!("path={path} CHATTR flags=0x{flags:x}"),
+            Self::SetAttr {
+                path,
+                mode,
+                uid,
+                gid,
+                flags,
+            } => format_setattr_body(path, *mode, *uid, *gid, *flags),
+        }
+    }
+
+    pub fn shell_hint(&self) -> String {
         match self {
             Self::Chmod { path, mode } => format!("chmod {:o} {}", mode, path),
-            Self::Chown { path, uid, gid } => format_chown_description(path, *uid, *gid),
+            Self::Chown { path, uid, gid } => format_chown_shell_hint(path, *uid, *gid),
             Self::Chattr { path, flags } => format!("chattr flags=0x{flags:x} {path}"),
             Self::SetAttr {
                 path,
@@ -91,21 +110,45 @@ impl MetadataOperation {
                 flags,
             } => match (mode, uid, gid, flags) {
                 (Some(mode), None, None, None) => format!("chmod {:o} {}", mode, path),
-                (None, Some(uid), None, None) => format_chown_description(path, Some(*uid), None),
-                (None, None, Some(gid), None) => format_chown_description(path, None, Some(*gid)),
+                (None, Some(uid), None, None) => format_chown_shell_hint(path, Some(*uid), None),
+                (None, None, Some(gid), None) => format_chown_shell_hint(path, None, Some(*gid)),
                 (None, Some(uid), Some(gid), None) => {
-                    format_chown_description(path, Some(*uid), Some(*gid))
+                    format_chown_shell_hint(path, Some(*uid), Some(*gid))
                 }
                 (None, None, None, Some(flags)) => format!("chattr flags=0x{flags:x} {path}"),
-                _ => {
-                    format!("setattr mode={mode:?} uid={uid:?} gid={gid:?} flags={flags:?} {path}")
-                }
+                _ => self.event_body(),
             },
         }
     }
 }
 
-fn format_chown_description(path: &SandboxPath, uid: Option<u32>, gid: Option<u32>) -> String {
+fn format_setattr_body(
+    path: &SandboxPath,
+    mode: Option<u16>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    flags: Option<u32>,
+) -> String {
+    let mut fields = Vec::new();
+    if let Some(mode) = mode {
+        fields.push(format!("mode={mode:04o}"));
+    }
+    if let Some(uid) = uid {
+        fields.push(format!("uid={uid}"));
+    }
+    if let Some(gid) = gid {
+        fields.push(format!("gid={gid}"));
+    }
+    if let Some(flags) = flags {
+        fields.push(format!("flags=0x{flags:x}"));
+    }
+    if fields.is_empty() {
+        fields.push("unchanged".to_string());
+    }
+    format!("path={path} SETATTR {}", fields.join(" "))
+}
+
+fn format_chown_shell_hint(path: &SandboxPath, uid: Option<u32>, gid: Option<u32>) -> String {
     match (uid, gid) {
         (Some(uid), Some(gid)) => format!("chown {uid}:{gid} {path}"),
         (Some(uid), None) => format!("chown {uid} {path}"),

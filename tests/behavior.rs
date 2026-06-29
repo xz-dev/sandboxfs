@@ -52,8 +52,9 @@ fn scenario_mappings_and_hide_rules_are_listed_and_logged() {
         .arg("monitor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("add"))
-        .stdout(predicate::str::contains("hide /app/cache"));
+        .stdout(predicate::str::contains("] id="))
+        .stdout(predicate::str::contains("mount local="))
+        .stdout(predicate::str::contains("hide path=/app/cache"));
 }
 
 #[test]

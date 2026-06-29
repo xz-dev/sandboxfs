@@ -65,8 +65,10 @@ fn mount_hide_umount_monitor_and_destroy_use_isolated_runtime() {
         .arg("monitor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("add"))
-        .stdout(predicate::str::contains("hide /data/a"));
+        .stdout(predicate::str::contains("] id="))
+        .stdout(predicate::str::contains("mount local="))
+        .stdout(predicate::str::contains("path=/data"))
+        .stdout(predicate::str::contains("hide path=/data/a"));
 
     session
         .sandbox_cmd()
