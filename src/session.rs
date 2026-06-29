@@ -1,0 +1,619 @@
+//! Foreground sandbox session server and state machine.
+
+use std::fs;
+use std::io;
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use fuser::{Config, MountOption};
+
+use crate::fs::SandboxFs;
+use crate::ipc::{self, Request, Response};
+use crate::log;
+use crate::path::SandboxPath;
+use crate::runtime::RuntimePaths;
+use crate::state::{
+    AttachMount, MetadataOperation, PendingDecision, Sandbox, SandboxRegistry, TrustedOperation,
+};
+use crate::{Error, Result};
+
+#[derive(Debug)]
+pub struct MountedSession {
+    pub sandbox: String,
+    pub mountpoint: PathBuf,
+    pub temporary: bool,
+    pub session: fuser::BackgroundSession,
+}
+
+#[derive(Debug)]
+pub struct SessionState {
+    pub registry: Arc<Mutex<SandboxRegistry>>,
+    pub runtime: RuntimePaths,
+    pub mounts: Mutex<Vec<MountedSession>>,
+}
+
+impl SessionState {
+    pub fn new(runtime: RuntimePaths) -> Self {
+        Self {
+            registry: Arc::new(Mutex::new(SandboxRegistry::new())),
+            runtime,
+            mounts: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn new_session(runtime: RuntimePaths, name: &str) -> Result<Self> {
+        let state = Self::new(runtime);
+        state.create_initial(name)?;
+        Ok(state)
+    }
+
+    fn create_initial(&self, name: &str) -> Result<()> {
+        validate_name(name)?;
+        let log_path = self.runtime.sandbox_log_path(name);
+        log::reset_log(&log_path)?;
+        let mut registry = self.registry.lock().unwrap();
+        registry
+            .sandboxes
+            .insert(name.to_string(), Sandbox::new(name, log_path));
+        Ok(())
+    }
+
+    pub fn handle(&self, request: Request) -> Response {
+        match self.handle_result(request) {
+            Ok(response) => response,
+            Err(error) => Response::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_result(&self, request: Request) -> Result<Response> {
+        match request {
+            Request::Ping => Ok(Response::Ok),
+            Request::Shutdown { name } => self.destroy(&name),
+            Request::Attach {
+                name,
+                mountpoint,
+                temporary,
+            } => self.attach(&name, PathBuf::from(mountpoint), temporary),
+            Request::Detach { name, mountpoint } => self.detach(&name, Path::new(&mountpoint)),
+            Request::Mount { name, local, on_fs } => {
+                self.mount_layer(&name, PathBuf::from(local), on_fs)
+            }
+            Request::Umount { name, on_fs } => self.umount_layer(&name, &on_fs),
+            Request::Hide { name, on_fs } => self.hide(&name, on_fs),
+            Request::ListMounts { name } => self.list_mounts(&name),
+            Request::Metadata { name } => self.metadata(&name),
+            Request::BeginTrustedOperation {
+                name,
+                command,
+                mountpoint,
+            } => self.begin_trusted(&name, &command, PathBuf::from(mountpoint)),
+            Request::RegisterTrustedPid { token, pid } => self.register_trusted_pid(&token, pid),
+            Request::EndTrustedOperation { token } => self.end_trusted(&token),
+            Request::ApplyMetadata { name, operation } => self.apply_metadata(&name, operation),
+            Request::Pending { name } => self.pending(&name),
+            Request::Allow {
+                name,
+                id,
+                do_nothing,
+            } => self.allow(&name, id, do_nothing),
+            Request::Deny { name, id } => self.deny(&name, id),
+            Request::LogPath { name } => self.log_path(&name),
+        }
+    }
+
+    pub fn destroy(&self, name: &str) -> Result<Response> {
+        let mountpoints: Vec<PathBuf> = {
+            let registry = self.registry.lock().unwrap();
+            let Some(sandbox) = registry.sandboxes.get(name) else {
+                return Err(Error::msg(format!("sandbox not found: {name}")));
+            };
+            sandbox.attaches.keys().cloned().collect()
+        };
+        for mountpoint in mountpoints {
+            self.detach(name, &mountpoint)?;
+        }
+        let mut registry = self.registry.lock().unwrap();
+        let Some(sandbox) = registry.sandboxes.remove(name) else {
+            return Ok(Response::Ok);
+        };
+        let removed_pending: Vec<u64> = registry
+            .pending
+            .iter()
+            .filter_map(|(id, pending)| (pending.sandbox == name).then_some(*id))
+            .collect();
+        for id in removed_pending {
+            registry.pending.remove(&id);
+            if let Some(waiter) = registry.pending_waiters.remove(&id) {
+                let (lock, cvar) = &*waiter;
+                *lock.lock().unwrap() = Some(PendingDecision::Deny);
+                cvar.notify_all();
+            }
+        }
+        registry
+            .trusted
+            .retain(|_, trusted| trusted.sandbox != name);
+        log::remove_log(&sandbox.log_path)?;
+        Ok(Response::Ok)
+    }
+
+    fn attach(&self, name: &str, mountpoint: PathBuf, temporary: bool) -> Result<Response> {
+        let mountpoint = canonicalize_existing_dir(&mountpoint)?;
+        {
+            let registry = self.registry.lock().unwrap();
+            if !registry.sandboxes.contains_key(name) {
+                return Err(Error::msg(format!("sandbox not found: {name}")));
+            }
+            for (other_name, sandbox) in &registry.sandboxes {
+                if sandbox.attaches.contains_key(&mountpoint) {
+                    if other_name == name {
+                        return Err(Error::msg(format!(
+                            "mountpoint already attached: {}",
+                            mountpoint.display()
+                        )));
+                    }
+                    return Err(Error::msg(format!(
+                        "mountpoint already used by sandbox {other_name}: {}",
+                        mountpoint.display()
+                    )));
+                }
+            }
+        }
+
+        let fs = SandboxFs::new(name.to_string(), Arc::clone(&self.registry));
+        let mut config = Config::default();
+        config.mount_options = vec![
+            MountOption::FSName(format!("sandboxfs:{name}")),
+            MountOption::Subtype("sandboxfs".to_string()),
+            MountOption::RW,
+        ];
+        let session = fuser::spawn_mount2(fs, &mountpoint, &config)?;
+        self.mounts.lock().unwrap().push(MountedSession {
+            sandbox: name.to_string(),
+            mountpoint: mountpoint.clone(),
+            temporary,
+            session,
+        });
+        let mut registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get_mut(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        sandbox.attaches.insert(
+            mountpoint.clone(),
+            AttachMount {
+                mountpoint: mountpoint.clone(),
+                temporary,
+                active: true,
+            },
+        );
+        Ok(Response::Ok)
+    }
+
+    fn detach(&self, name: &str, mountpoint: &Path) -> Result<Response> {
+        let mountpoint = canonicalize_maybe_existing(mountpoint)?;
+        {
+            let registry = self.registry.lock().unwrap();
+            let sandbox = registry
+                .sandboxes
+                .get(name)
+                .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+            if !sandbox.attaches.contains_key(&mountpoint) {
+                return Err(Error::msg(format!(
+                    "mountpoint is not attached to sandbox {name}: {}",
+                    mountpoint.display()
+                )));
+            }
+        }
+
+        let session = {
+            let mut mounts = self.mounts.lock().unwrap();
+            let idx = mounts
+                .iter()
+                .position(|mounted| mounted.sandbox == name && mounted.mountpoint == mountpoint)
+                .ok_or_else(|| {
+                    Error::msg(format!("mount session not found: {}", mountpoint.display()))
+                })?;
+            mounts.remove(idx)
+        };
+        session.session.umount_and_join()?;
+        let mut registry = self.registry.lock().unwrap();
+        if let Some(sandbox) = registry.sandboxes.get_mut(name) {
+            sandbox.attaches.remove(&mountpoint);
+        }
+        Ok(Response::Ok)
+    }
+
+    fn mount_layer(&self, name: &str, local: PathBuf, on_fs: SandboxPath) -> Result<Response> {
+        let local = fs::canonicalize(&local)?;
+        if !local.exists() {
+            return Err(Error::msg(format!(
+                "local path does not exist: {}",
+                local.display()
+            )));
+        }
+        let mut registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get_mut(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        sandbox.add_layer(local.clone(), on_fs.clone());
+        log::append_log(
+            &sandbox.log_path,
+            format!("add {} on {}", local.display(), on_fs),
+        )?;
+        Ok(Response::Ok)
+    }
+
+    fn umount_layer(&self, name: &str, on_fs: &SandboxPath) -> Result<Response> {
+        let mut registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get_mut(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        if !sandbox.remove_layer(on_fs) {
+            return Err(Error::msg(format!("no mount at {on_fs}")));
+        }
+        log::append_log(&sandbox.log_path, format!("del {on_fs}"))?;
+        Ok(Response::Ok)
+    }
+
+    fn hide(&self, name: &str, on_fs: SandboxPath) -> Result<Response> {
+        let mut registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get_mut(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        sandbox.add_hide(on_fs.clone());
+        log::append_log(&sandbox.log_path, format!("hide {on_fs}"))?;
+        Ok(Response::Ok)
+    }
+
+    fn list_mounts(&self, name: &str) -> Result<Response> {
+        let registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        let mut lines = Vec::new();
+        for layer in &sandbox.layers {
+            lines.push(format!("{} on {}", layer.local.display(), layer.on_fs));
+        }
+        for hide in &sandbox.hides {
+            lines.push(format!("hide {}", hide.path));
+        }
+        Ok(Response::Text {
+            text: lines.join("\n"),
+        })
+    }
+
+    fn metadata(&self, name: &str) -> Result<Response> {
+        let registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        let lines: Vec<String> = sandbox
+            .metadata_differences()
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+        Ok(Response::Text {
+            text: lines.join("\n"),
+        })
+    }
+
+    fn begin_trusted(
+        &self,
+        name: &str,
+        command: &str,
+        requested_mountpoint: PathBuf,
+    ) -> Result<Response> {
+        let operation_id = {
+            let mut registry = self.registry.lock().unwrap();
+            if !registry.sandboxes.contains_key(name) {
+                return Err(Error::msg(format!("sandbox not found: {name}")));
+            }
+            registry.next_operation_id()
+        };
+        fs::create_dir_all(&requested_mountpoint)?;
+        self.attach(name, requested_mountpoint.clone(), true)?;
+        let token = format!("{name}-{operation_id}-{}", std::process::id());
+        let mut registry = self.registry.lock().unwrap();
+        registry.trusted.insert(
+            token.clone(),
+            TrustedOperation {
+                id: operation_id,
+                sandbox: name.to_string(),
+                token: token.clone(),
+                pid: None,
+                mountpoint: requested_mountpoint.clone(),
+                command: command.to_string(),
+            },
+        );
+        Ok(Response::Trusted {
+            token,
+            operation_id,
+            mountpoint: requested_mountpoint.display().to_string(),
+        })
+    }
+
+    fn register_trusted_pid(&self, token: &str, pid: u32) -> Result<Response> {
+        let mut registry = self.registry.lock().unwrap();
+        let trusted = registry
+            .trusted
+            .get_mut(token)
+            .ok_or_else(|| Error::msg(format!("trusted operation not found: {token}")))?;
+        trusted.pid = Some(pid);
+        Ok(Response::Ok)
+    }
+
+    fn end_trusted(&self, token: &str) -> Result<Response> {
+        let trusted = self.registry.lock().unwrap().trusted.remove(token);
+        if let Some(trusted) = trusted {
+            let _ = self.detach(&trusted.sandbox, &trusted.mountpoint);
+            let _ = fs::remove_dir(&trusted.mountpoint);
+            Ok(Response::Ok)
+        } else {
+            Err(Error::msg(format!("trusted operation not found: {token}")))
+        }
+    }
+
+    fn apply_metadata(&self, name: &str, operation: MetadataOperation) -> Result<Response> {
+        let mut registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get_mut(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        sandbox.apply_metadata_override(&operation)?;
+        log::append_log(&sandbox.log_path, operation.description())?;
+        Ok(Response::Ok)
+    }
+
+    fn pending(&self, name: &str) -> Result<Response> {
+        let registry = self.registry.lock().unwrap();
+        if !registry.sandboxes.contains_key(name) {
+            return Err(Error::msg(format!("sandbox not found: {name}")));
+        }
+        let items = registry
+            .pending
+            .values()
+            .filter(|p| p.sandbox == name)
+            .cloned()
+            .collect();
+        Ok(Response::Pending { items })
+    }
+
+    fn allow(&self, name: &str, id: u64, do_nothing: bool) -> Result<Response> {
+        let mut registry = self.registry.lock().unwrap();
+        let pending = registry
+            .pending
+            .remove(&id)
+            .ok_or_else(|| Error::msg(format!("pending operation not found: {id}")))?;
+        if pending.sandbox != name {
+            registry.pending.insert(id, pending);
+            return Err(Error::msg(format!(
+                "pending operation {id} does not belong to sandbox {name}"
+            )));
+        }
+        let waiter = registry.pending_waiters.remove(&id);
+        if waiter.is_none() && !do_nothing {
+            let sandbox = registry
+                .sandboxes
+                .get_mut(name)
+                .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+            sandbox.apply_metadata_override(&pending.operation)?;
+        }
+        if let Some(waiter) = waiter {
+            let (lock, cvar) = &*waiter;
+            *lock.lock().unwrap() = Some(if do_nothing {
+                PendingDecision::DoNothing
+            } else {
+                PendingDecision::Apply
+            });
+            cvar.notify_all();
+        }
+        Ok(Response::Ok)
+    }
+
+    fn deny(&self, name: &str, id: u64) -> Result<Response> {
+        let mut registry = self.registry.lock().unwrap();
+        let pending = registry
+            .pending
+            .remove(&id)
+            .ok_or_else(|| Error::msg(format!("pending operation not found: {id}")))?;
+        if pending.sandbox != name {
+            registry.pending.insert(id, pending);
+            return Err(Error::msg(format!(
+                "pending operation {id} does not belong to sandbox {name}"
+            )));
+        }
+        if let Some(waiter) = registry.pending_waiters.remove(&id) {
+            let (lock, cvar) = &*waiter;
+            *lock.lock().unwrap() = Some(PendingDecision::Deny);
+            cvar.notify_all();
+        }
+        Ok(Response::Ok)
+    }
+
+    fn log_path(&self, name: &str) -> Result<Response> {
+        let registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        Ok(Response::Text {
+            text: sandbox.log_path.display().to_string(),
+        })
+    }
+}
+
+pub fn serve_session(runtime: RuntimePaths, name: String) -> Result<()> {
+    let socket = runtime.socket_path(&name);
+    if let Some(parent) = socket.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    prepare_socket_path(&socket)?;
+    let listener = UnixListener::bind(&socket)?;
+    listener.set_nonblocking(true)?;
+    let state = Arc::new(SessionState::new_session(runtime.clone(), &name)?);
+    let stop = Arc::new(AtomicBool::new(false));
+    install_signal_handlers(Arc::clone(&stop))?;
+
+    println!("sandboxfs {name} running");
+    println!("socket: {}", socket.display());
+    println!("log:    {}", runtime.sandbox_log_path(&name).display());
+    println!("press Ctrl-C or run `sandboxfs {name} destroy` to stop");
+
+    while !stop.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let state = Arc::clone(&state);
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || {
+                    let request = match ipc::read_request(&stream) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            let _ = ipc::write_response(
+                                stream,
+                                &Response::Error {
+                                    message: error.to_string(),
+                                },
+                            );
+                            return;
+                        }
+                    };
+                    let is_shutdown = matches!(request, Request::Shutdown { .. });
+                    let response = state.handle(request);
+                    let _ = ipc::write_response(stream, &response);
+                    if is_shutdown && matches!(response, Response::Ok) {
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    let cleanup_result = state.destroy(&name);
+    match cleanup_result {
+        Ok(_) | Err(Error::Message(_)) => {}
+        Err(error) => return Err(error),
+    }
+    let _ = fs::remove_file(socket);
+    Ok(())
+}
+
+static SIGNAL_HANDLERS: OnceLock<Vec<signal_hook::iterator::Handle>> = OnceLock::new();
+
+fn install_signal_handlers(stop: Arc<AtomicBool>) -> Result<()> {
+    if SIGNAL_HANDLERS.get().is_some() {
+        return Ok(());
+    }
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ])?;
+    let handle = signals.handle();
+    thread::spawn(move || {
+        for _ in signals.forever() {
+            stop.store(true, Ordering::SeqCst);
+        }
+    });
+    let _ = SIGNAL_HANDLERS.set(vec![handle]);
+    Ok(())
+}
+
+fn prepare_socket_path(socket: &Path) -> Result<()> {
+    match ipc::send(socket, &Request::Ping) {
+        Ok(_) => {
+            return Err(Error::msg(format!(
+                "sandbox session socket is already active: {}",
+                socket.display()
+            )));
+        }
+        Err(_) if socket.exists() => match fs::remove_file(socket) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        },
+        Err(_) => {}
+    }
+    Ok(())
+}
+
+fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('/') || name.contains('\0') {
+        return Err(Error::msg(format!("invalid sandbox name: {name}")));
+    }
+    Ok(())
+}
+
+fn canonicalize_existing_dir(path: &Path) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
+    if !canonical.is_dir() {
+        return Err(Error::msg(format!(
+            "mountpoint is not a directory: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn canonicalize_maybe_existing(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        Ok(fs::canonicalize(path)?)
+    } else if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn new_session_contains_named_sandbox() {
+        let temp = TempDir::new().unwrap();
+        let runtime = RuntimePaths::for_tests(temp.path().to_path_buf(), None);
+        let session = SessionState::new_session(runtime, "a").unwrap();
+        assert!(session.registry.lock().unwrap().sandboxes.contains_key("a"));
+    }
+
+    #[test]
+    fn detach_unknown_mountpoint_fails() {
+        let temp = TempDir::new().unwrap();
+        let runtime = RuntimePaths::for_tests(temp.path().to_path_buf(), None);
+        let session = SessionState::new_session(runtime, "a").unwrap();
+        match session.handle(Request::Detach {
+            name: "a".into(),
+            mountpoint: temp.path().join("m").display().to_string(),
+        }) {
+            Response::Error { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn destroy_unknown_sandbox_fails() {
+        let temp = TempDir::new().unwrap();
+        let runtime = RuntimePaths::for_tests(temp.path().to_path_buf(), None);
+        let session = SessionState::new_session(runtime, "a").unwrap();
+        match session.handle(Request::Shutdown { name: "b".into() }) {
+            Response::Error { message } => assert!(message.contains("sandbox not found")),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
