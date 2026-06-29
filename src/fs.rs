@@ -18,8 +18,8 @@ use fuser::{
 use crate::log;
 use crate::path::SandboxPath;
 use crate::state::{
-    MetadataOperation, PendingDecision, PendingWaiter, ResolvedPath, SandboxRegistry, TTL,
-    apply_override, mode_to_kind, stable_ino, virtual_dir_attr,
+    MetadataOperation, PendingDecision, PendingMetadataRequest, PendingWaiter, ResolvedPath,
+    SandboxRegistry, TTL, apply_override, mode_to_kind, stable_ino, virtual_dir_attr,
 };
 
 const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
@@ -40,6 +40,18 @@ struct RequestIdentity {
     pid: u32,
     uid: u32,
     gid: u32,
+}
+
+struct PendingMetadataOutcome {
+    unchanged_attr: FileAttr,
+    path: SandboxPath,
+    operation: MetadataOperation,
+    waiter: PendingWaiter,
+}
+
+enum MetadataOutcome {
+    Applied(FileAttr),
+    Pending(PendingMetadataOutcome),
 }
 
 impl RequestIdentity {
@@ -128,25 +140,25 @@ impl SandboxFs {
         })
     }
 
-    fn create_pending_or_apply(
-        &self,
-        req: &Request,
-        path: SandboxPath,
-        operation: MetadataOperation,
-    ) -> std::result::Result<FileAttr, Errno> {
-        self.create_pending_or_apply_for_identity(
-            RequestIdentity::from_request(req),
-            path,
-            operation,
-        )
-    }
-
+    #[cfg(test)]
     fn create_pending_or_apply_for_identity(
         &self,
         identity: RequestIdentity,
         path: SandboxPath,
         operation: MetadataOperation,
     ) -> std::result::Result<FileAttr, Errno> {
+        match self.begin_metadata_request(identity, path, operation)? {
+            MetadataOutcome::Applied(attr) => Ok(attr),
+            MetadataOutcome::Pending(pending) => self.finish_pending_attr(pending),
+        }
+    }
+
+    fn begin_metadata_request(
+        &self,
+        identity: RequestIdentity,
+        path: SandboxPath,
+        operation: MetadataOperation,
+    ) -> std::result::Result<MetadataOutcome, Errno> {
         let unchanged_attr = self.attr_for_path(&path)?;
         let mut registry = self.registry.lock().unwrap();
         let trusted = Self::is_trusted_operation(
@@ -200,59 +212,140 @@ impl SandboxFs {
                 .apply_metadata_override(&operation)
                 .map_err(|_| Errno::ENOTSUP)?;
             drop(registry);
-            return self.attr_for_path(&path);
+            return self.attr_for_path(&path).map(MetadataOutcome::Applied);
         }
 
-        let id = registry.next_operation_id();
         let description = operation.event_body();
+        let kinds = operation.pending_kinds();
+        if kinds.is_empty() {
+            return Ok(MetadataOutcome::Applied(unchanged_attr));
+        }
         let log_path = registry
             .sandboxes
             .get(&self.sandbox_name)
             .map(|s| s.log_path.clone())
             .ok_or(Errno::ENOENT)?;
         let waiter: PendingWaiter = Arc::new((Mutex::new(None), Condvar::new()));
-        self.log_writer
+        let mut superseded_waiters = Vec::new();
+        let mut log_failed = false;
+
+        let replacement_ids: Vec<u64> = operation
+            .pending_keys(&self.sandbox_name)
+            .into_iter()
+            .filter_map(|key| registry.pending_index.remove(&key))
+            .collect();
+        let mut unique_replacement_ids = Vec::new();
+        for id in replacement_ids {
+            if !unique_replacement_ids.contains(&id) {
+                unique_replacement_ids.push(id);
+            }
+        }
+        for old_id in unique_replacement_ids {
+            if registry.remove_pending_request(old_id).is_some() {
+                let decision_id = registry.next_operation_id();
+                if self
+                    .log_writer
+                    .append(
+                        &log_path,
+                        log::format_log_line(
+                            decision_id,
+                            &format!("decision request={old_id} DENY reason=superseded"),
+                        ),
+                    )
+                    .is_err()
+                {
+                    log_failed = true;
+                }
+                superseded_waiters.push(registry.pending_waiters.remove(&old_id));
+            }
+        }
+
+        let id = registry.next_operation_id();
+        if self
+            .log_writer
             .append(
                 &log_path,
                 log::format_log_line(id, &format!("pending {description}")),
             )
-            .map_err(|_| Errno::EIO)?;
-        registry.pending.insert(
+            .is_err()
+        {
+            log_failed = true;
+        }
+        for waiter in superseded_waiters {
+            notify_waiter(waiter, PendingDecision::Deny);
+        }
+        if log_failed {
+            return Err(Errno::EIO);
+        }
+
+        let request = PendingMetadataRequest {
             id,
-            crate::state::PendingMetadataRequest {
-                id,
-                sandbox: self.sandbox_name.clone(),
-                operation: operation.clone(),
-                pid: identity.pid,
-                uid: identity.uid,
-                gid: identity.gid,
-                description: description.clone(),
-            },
-        );
+            sandbox: self.sandbox_name.clone(),
+            operation: operation.clone(),
+            kinds,
+            pid: identity.pid,
+            uid: identity.uid,
+            gid: identity.gid,
+            description: description.clone(),
+        };
+        registry.insert_pending_request(request);
         registry.pending_waiters.insert(id, Arc::clone(&waiter));
         drop(registry);
 
-        let (lock, cvar) = &*waiter;
-        let mut decision = lock.lock().unwrap();
-        while decision.is_none() {
-            decision = cvar.wait(decision).unwrap();
-        }
-        match decision.unwrap() {
+        Ok(MetadataOutcome::Pending(PendingMetadataOutcome {
+            unchanged_attr,
+            path,
+            operation,
+            waiter,
+        }))
+    }
+
+    fn finish_pending_attr(
+        &self,
+        pending: PendingMetadataOutcome,
+    ) -> std::result::Result<FileAttr, Errno> {
+        match wait_for_decision(&pending.waiter) {
             PendingDecision::Apply => {
-                let mut registry = self.registry.lock().unwrap();
-                let sandbox = registry
-                    .sandboxes
-                    .get_mut(&self.sandbox_name)
-                    .ok_or(Errno::ENOENT)?;
-                sandbox
-                    .apply_metadata_override(&operation)
-                    .map_err(|_| Errno::ENOTSUP)?;
-                drop(registry);
-                self.attr_for_path(&path)
+                self.apply_pending_operation(&pending.operation)?;
+                self.attr_for_path(&pending.path)
             }
-            PendingDecision::DoNothing => Ok(unchanged_attr),
+            PendingDecision::DoNothing => Ok(pending.unchanged_attr),
             PendingDecision::Deny => Err(Errno::EPERM),
         }
+    }
+
+    fn apply_pending_operation(
+        &self,
+        operation: &MetadataOperation,
+    ) -> std::result::Result<(), Errno> {
+        let mut registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get_mut(&self.sandbox_name)
+            .ok_or(Errno::ENOENT)?;
+        sandbox
+            .apply_metadata_override(operation)
+            .map_err(|_| Errno::ENOTSUP)
+    }
+
+    fn spawn_attr_waiter(&self, pending: PendingMetadataOutcome, reply: ReplyAttr) {
+        let fs = self.clone();
+        std::thread::spawn(move || match fs.finish_pending_attr(pending) {
+            Ok(attr) => reply.attr(&TTL, &attr),
+            Err(err) => reply.error(err),
+        });
+    }
+
+    fn spawn_ioctl_waiter(&self, pending: PendingMetadataOutcome, reply: ReplyIoctl) {
+        let fs = self.clone();
+        std::thread::spawn(move || match wait_for_decision(&pending.waiter) {
+            PendingDecision::Apply => match fs.apply_pending_operation(&pending.operation) {
+                Ok(()) => reply.ioctl(0, &[]),
+                Err(err) => reply.error(err),
+            },
+            PendingDecision::DoNothing => reply.ioctl(0, &[]),
+            PendingDecision::Deny => reply.error(Errno::EPERM),
+        });
     }
 }
 
@@ -438,8 +531,9 @@ impl Filesystem for SandboxFs {
             gid,
             flags: flags.map(|f| f.bits()),
         };
-        match self.create_pending_or_apply(req, path, operation) {
-            Ok(attr) => reply.attr(&TTL, &attr),
+        match self.begin_metadata_request(RequestIdentity::from_request(req), path, operation) {
+            Ok(MetadataOutcome::Applied(attr)) => reply.attr(&TTL, &attr),
+            Ok(MetadataOutcome::Pending(pending)) => self.spawn_attr_waiter(pending, reply),
             Err(err) => reply.error(err),
         }
     }
@@ -476,8 +570,9 @@ impl Filesystem for SandboxFs {
                 path: path.clone(),
                 flags,
             };
-            match self.create_pending_or_apply(req, path, operation) {
-                Ok(_) => reply.ioctl(0, &[]),
+            match self.begin_metadata_request(RequestIdentity::from_request(req), path, operation) {
+                Ok(MetadataOutcome::Applied(_)) => reply.ioctl(0, &[]),
+                Ok(MetadataOutcome::Pending(pending)) => self.spawn_ioctl_waiter(pending, reply),
                 Err(err) => reply.error(err),
             }
             return;
@@ -544,6 +639,23 @@ impl Filesystem for SandboxFs {
         reply: ReplyEmpty,
     ) {
         reply.error(Errno::EROFS);
+    }
+}
+
+fn wait_for_decision(waiter: &PendingWaiter) -> PendingDecision {
+    let (lock, cvar) = &**waiter;
+    let mut decision = lock.lock().unwrap();
+    while decision.is_none() {
+        decision = cvar.wait(decision).unwrap();
+    }
+    decision.unwrap()
+}
+
+fn notify_waiter(waiter: Option<PendingWaiter>, decision: PendingDecision) {
+    if let Some(waiter) = waiter {
+        let (lock, cvar) = &*waiter;
+        *lock.lock().unwrap() = Some(decision);
+        cvar.notify_all();
     }
 }
 
@@ -683,7 +795,7 @@ mod tests {
 
         let waiter = {
             let mut registry = registry.lock().unwrap();
-            registry.pending.remove(&id);
+            registry.remove_pending_request(id);
             registry.pending_waiters.remove(&id).unwrap()
         };
         let (lock, cvar) = &*waiter;
@@ -746,6 +858,161 @@ mod tests {
                 & 0o777,
             0o644
         );
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn same_path_same_kind_replaces_and_denies_old_request() {
+        let temp = TempDir::new().unwrap();
+        let log_path = temp.path().join("logs/demo.log");
+        let registry = registry_with_file(&temp, log_path.clone());
+        let writer = log::LogWriter::new();
+        let fs = SandboxFs::new("demo", Arc::clone(&registry), writer.handle());
+        let identity = RequestIdentity {
+            pid: 123,
+            uid: 1000,
+            gid: 1000,
+        };
+        let path = SandboxPath::new("/data/file").unwrap();
+
+        let first = fs
+            .begin_metadata_request(
+                identity,
+                path.clone(),
+                MetadataOperation::Chmod {
+                    path: path.clone(),
+                    mode: 0o444,
+                },
+            )
+            .unwrap();
+        let first = match first {
+            MetadataOutcome::Pending(pending) => pending,
+            MetadataOutcome::Applied(_) => panic!("expected pending request"),
+        };
+        let second = fs
+            .begin_metadata_request(
+                identity,
+                path.clone(),
+                MetadataOperation::Chmod { path, mode: 0o600 },
+            )
+            .unwrap();
+        let second = match second {
+            MetadataOutcome::Pending(pending) => pending,
+            MetadataOutcome::Applied(_) => panic!("expected pending request"),
+        };
+
+        assert_eq!(*first.waiter.0.lock().unwrap(), Some(PendingDecision::Deny));
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .pending
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(*second.waiter.0.lock().unwrap(), None);
+        let data = log::read_log(&log_path).unwrap();
+        assert!(data.contains(" id=1 pending path=/data/file SETATTR mode=0444"));
+        assert!(data.contains(" id=2 decision request=1 DENY reason=superseded"));
+        assert!(data.contains(" id=3 pending path=/data/file SETATTR mode=0600"));
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn same_path_different_kinds_remain_pending_independently() {
+        let temp = TempDir::new().unwrap();
+        let log_path = temp.path().join("logs/demo.log");
+        let registry = registry_with_file(&temp, log_path.clone());
+        let writer = log::LogWriter::new();
+        let fs = SandboxFs::new("demo", Arc::clone(&registry), writer.handle());
+        let identity = RequestIdentity {
+            pid: 123,
+            uid: 1000,
+            gid: 1000,
+        };
+        let path = SandboxPath::new("/data/file").unwrap();
+
+        let uid_request = fs
+            .begin_metadata_request(
+                identity,
+                path.clone(),
+                MetadataOperation::SetAttr {
+                    path: path.clone(),
+                    mode: None,
+                    uid: Some(2000),
+                    gid: None,
+                    flags: None,
+                },
+            )
+            .unwrap();
+        let gid_request = fs
+            .begin_metadata_request(
+                identity,
+                path.clone(),
+                MetadataOperation::SetAttr {
+                    path,
+                    mode: None,
+                    uid: None,
+                    gid: Some(3000),
+                    flags: None,
+                },
+            )
+            .unwrap();
+
+        let uid_request = match uid_request {
+            MetadataOutcome::Pending(pending) => pending,
+            MetadataOutcome::Applied(_) => panic!("expected pending request"),
+        };
+        let gid_request = match gid_request {
+            MetadataOutcome::Pending(pending) => pending,
+            MetadataOutcome::Applied(_) => panic!("expected pending request"),
+        };
+        assert_eq!(*uid_request.waiter.0.lock().unwrap(), None);
+        assert_eq!(*gid_request.waiter.0.lock().unwrap(), None);
+        let pending_ids = registry
+            .lock()
+            .unwrap()
+            .pending
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(pending_ids, vec![1, 2]);
+        let data = log::read_log(&log_path).unwrap();
+        assert!(data.contains(" id=1 pending path=/data/file SETATTR uid=2000"));
+        assert!(data.contains(" id=2 pending path=/data/file SETATTR gid=3000"));
+        assert!(!data.contains("reason=superseded"));
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn pending_metadata_request_does_not_block_unrelated_lookup() {
+        let temp = TempDir::new().unwrap();
+        let log_path = temp.path().join("logs/demo.log");
+        let registry = registry_with_file(&temp, log_path);
+        std::fs::write(temp.path().join("local/other"), "world").unwrap();
+        let writer = log::LogWriter::new();
+        let fs = SandboxFs::new("demo", registry, writer.handle());
+        let path = SandboxPath::new("/data/file").unwrap();
+
+        let outcome = fs
+            .begin_metadata_request(
+                RequestIdentity {
+                    pid: 123,
+                    uid: 1000,
+                    gid: 1000,
+                },
+                path.clone(),
+                MetadataOperation::Chmod { path, mode: 0o444 },
+            )
+            .unwrap();
+        assert!(matches!(outcome, MetadataOutcome::Pending(_)));
+
+        let unrelated = fs
+            .attr_for_path(&SandboxPath::new("/data/other").unwrap())
+            .unwrap();
+        assert_eq!(unrelated.perm, 0o644);
         writer.shutdown().unwrap();
     }
 }

@@ -148,7 +148,7 @@ fn direct_chmod_pending_can_be_allowed_denied_or_do_nothing() {
             .sandbox_cmd()
             .arg("allow")
             .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).contains("chmod"))
+            .map(|out| String::from_utf8_lossy(&out.stdout).contains("mode=0444"))
             .unwrap_or(false)
     }));
     let pending =
@@ -180,7 +180,7 @@ fn direct_chmod_pending_can_be_allowed_denied_or_do_nothing() {
             .sandbox_cmd()
             .arg("allow")
             .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).contains("555"))
+            .map(|out| String::from_utf8_lossy(&out.stdout).contains("mode=0555"))
             .unwrap_or(false)
     }));
     let pending =
@@ -210,7 +210,7 @@ fn direct_chmod_pending_can_be_allowed_denied_or_do_nothing() {
             .sandbox_cmd()
             .arg("allow")
             .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).contains("600"))
+            .map(|out| String::from_utf8_lossy(&out.stdout).contains("mode=0600"))
             .unwrap_or(false)
     }));
     let pending =

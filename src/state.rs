@@ -44,6 +44,22 @@ impl MetadataOverride {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingOperationKind {
+    Mode,
+    Uid,
+    Gid,
+    Flags,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PendingOperationKey {
+    pub sandbox: String,
+    pub path: SandboxPath,
+    pub kind: PendingOperationKind,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MetadataOperation {
     Chmod {
@@ -95,6 +111,54 @@ impl MetadataOperation {
                 flags,
             } => format_setattr_body(path, *mode, *uid, *gid, *flags),
         }
+    }
+
+    pub fn pending_kinds(&self) -> Vec<PendingOperationKind> {
+        let mut kinds = Vec::new();
+        match self {
+            Self::Chmod { .. } => kinds.push(PendingOperationKind::Mode),
+            Self::Chown { uid, gid, .. } => {
+                if uid.is_some() {
+                    kinds.push(PendingOperationKind::Uid);
+                }
+                if gid.is_some() {
+                    kinds.push(PendingOperationKind::Gid);
+                }
+            }
+            Self::Chattr { .. } => kinds.push(PendingOperationKind::Flags),
+            Self::SetAttr {
+                mode,
+                uid,
+                gid,
+                flags,
+                ..
+            } => {
+                if mode.is_some() {
+                    kinds.push(PendingOperationKind::Mode);
+                }
+                if uid.is_some() {
+                    kinds.push(PendingOperationKind::Uid);
+                }
+                if gid.is_some() {
+                    kinds.push(PendingOperationKind::Gid);
+                }
+                if flags.is_some() {
+                    kinds.push(PendingOperationKind::Flags);
+                }
+            }
+        }
+        kinds
+    }
+
+    pub fn pending_keys(&self, sandbox: &str) -> Vec<PendingOperationKey> {
+        self.pending_kinds()
+            .into_iter()
+            .map(|kind| PendingOperationKey {
+                sandbox: sandbox.to_string(),
+                path: self.path().clone(),
+                kind,
+            })
+            .collect()
     }
 
     pub fn shell_hint(&self) -> String {
@@ -162,10 +226,25 @@ pub struct PendingMetadataRequest {
     pub id: u64,
     pub sandbox: String,
     pub operation: MetadataOperation,
+    pub kinds: Vec<PendingOperationKind>,
     pub pid: u32,
     pub uid: u32,
     pub gid: u32,
     pub description: String,
+}
+
+impl PendingMetadataRequest {
+    pub fn keys(&self) -> Vec<PendingOperationKey> {
+        self.kinds
+            .iter()
+            .copied()
+            .map(|kind| PendingOperationKey {
+                sandbox: self.sandbox.clone(),
+                path: self.operation.path().clone(),
+                kind,
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,6 +505,7 @@ pub struct SandboxRegistry {
     pub sandboxes: HashMap<String, Sandbox>,
     pub pending: BTreeMap<u64, PendingMetadataRequest>,
     pub pending_waiters: HashMap<u64, PendingWaiter>,
+    pub pending_index: BTreeMap<PendingOperationKey, u64>,
     pub trusted: HashMap<String, TrustedOperation>,
     pub next_operation_id: u64,
 }
@@ -449,6 +529,23 @@ impl SandboxRegistry {
             .values()
             .flat_map(|sandbox| sandbox.attaches.keys().cloned())
             .collect()
+    }
+
+    pub fn insert_pending_request(&mut self, request: PendingMetadataRequest) {
+        for key in request.keys() {
+            self.pending_index.insert(key, request.id);
+        }
+        self.pending.insert(request.id, request);
+    }
+
+    pub fn remove_pending_request(&mut self, id: u64) -> Option<PendingMetadataRequest> {
+        let request = self.pending.remove(&id)?;
+        for key in request.keys() {
+            if self.pending_index.get(&key) == Some(&id) {
+                self.pending_index.remove(&key);
+            }
+        }
+        Some(request)
     }
 }
 

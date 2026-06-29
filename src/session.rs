@@ -138,7 +138,7 @@ impl SessionState {
                 .collect();
             let mut waiters = Vec::new();
             for id in removed_pending {
-                registry.pending.remove(&id);
+                registry.remove_pending_request(id);
                 if let Some(waiter) = registry.pending_waiters.remove(&id) {
                     waiters.push(waiter);
                 }
@@ -420,11 +420,10 @@ impl SessionState {
     fn allow(&self, name: &str, id: u64, do_nothing: bool) -> Result<Response> {
         let mut registry = self.registry.lock().unwrap();
         let pending = registry
-            .pending
-            .remove(&id)
+            .remove_pending_request(id)
             .ok_or_else(|| Error::msg(format!("pending operation not found: {id}")))?;
         if pending.sandbox != name {
-            registry.pending.insert(id, pending);
+            registry.insert_pending_request(pending);
             return Err(Error::msg(format!(
                 "pending operation {id} does not belong to sandbox {name}"
             )));
@@ -473,11 +472,10 @@ impl SessionState {
     fn deny(&self, name: &str, id: u64) -> Result<Response> {
         let mut registry = self.registry.lock().unwrap();
         let pending = registry
-            .pending
-            .remove(&id)
+            .remove_pending_request(id)
             .ok_or_else(|| Error::msg(format!("pending operation not found: {id}")))?;
         if pending.sandbox != name {
-            registry.pending.insert(id, pending);
+            registry.insert_pending_request(pending);
             return Err(Error::msg(format!(
                 "pending operation {id} does not belong to sandbox {name}"
             )));
@@ -799,21 +797,19 @@ mod tests {
         {
             let mut registry = session.registry.lock().unwrap();
             registry.next_operation_id = 2;
-            registry.pending.insert(
-                1,
-                crate::state::PendingMetadataRequest {
-                    id: 1,
-                    sandbox: "a".to_string(),
-                    operation: crate::state::MetadataOperation::Chmod {
-                        path: SandboxPath::new("/data/file").unwrap(),
-                        mode: 0o444,
-                    },
-                    pid: 123,
-                    uid: 1000,
-                    gid: 1000,
-                    description: "path=/data/file SETATTR mode=0444".to_string(),
+            registry.insert_pending_request(crate::state::PendingMetadataRequest {
+                id: 1,
+                sandbox: "a".to_string(),
+                operation: crate::state::MetadataOperation::Chmod {
+                    path: SandboxPath::new("/data/file").unwrap(),
+                    mode: 0o444,
                 },
-            );
+                kinds: vec![crate::state::PendingOperationKind::Mode],
+                pid: 123,
+                uid: 1000,
+                gid: 1000,
+                description: "path=/data/file SETATTR mode=0444".to_string(),
+            });
             registry.pending_waiters.insert(1, Arc::clone(&waiter));
         }
         (temp, session, writer, waiter)

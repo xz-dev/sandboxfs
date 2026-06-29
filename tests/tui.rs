@@ -33,6 +33,7 @@ fn tui_renders_pending_request_and_controls() {
             path: SandboxPath::new("/data/file").unwrap(),
             mode: 0o444,
         },
+        kinds: vec![sandboxfs::state::PendingOperationKind::Mode],
         pid: 123,
         uid: 1000,
         gid: 1000,
