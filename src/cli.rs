@@ -14,7 +14,10 @@ use crate::ipc::{self, Request, Response};
 use crate::path::{SandboxPath, rewrite_sandbox_path_arg};
 use crate::runtime::RuntimePaths;
 use crate::session;
-use crate::state::{PendingRequest, ProtectionKind, ProtectionRule, TrustedPathScope};
+use crate::state::{
+    DEFAULT_READ_WRITE_GRANT_DURATION, PendingRequest, ProtectionKind, ProtectionRule,
+    ReadWriteGrantLifetimeRequest, ReadWriteGrantOptions, TrustedPathScope,
+};
 use crate::{Error, Result};
 
 #[derive(Debug, Parser)]
@@ -96,6 +99,12 @@ enum SandboxCommand {
     Allow {
         #[arg(long, action = ArgAction::SetTrue)]
         do_nothing: bool,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "30m", require_equals = true)]
+        duration: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        tree: bool,
         id: Option<u64>,
     },
     Deny {
@@ -241,6 +250,9 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
         SandboxCommand::Chattr { args } => run_trusted_command(runtime, &name, "chattr", args),
         SandboxCommand::Allow {
             do_nothing: false,
+            path: None,
+            duration: None,
+            tree: false,
             id: None,
         } => print_response(send(
             runtime,
@@ -250,19 +262,35 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
         SandboxCommand::Allow {
             do_nothing: true,
             id: None,
+            ..
         } => Err(Error::msg("allow --do-nothing requires an operation id")),
+        SandboxCommand::Allow { id: None, .. } => Err(Error::msg(
+            "read/write grant options require an operation id",
+        )),
         SandboxCommand::Allow {
             do_nothing,
+            path,
+            duration,
+            tree,
             id: Some(id),
-        } => print_response(send(
-            runtime,
-            &name,
-            &Request::Allow {
-                name: name.clone(),
-                id,
-                do_nothing,
-            },
-        )?),
+        } => {
+            let grant = parse_read_write_grant_options(path, duration, tree)?;
+            if do_nothing && grant.is_some() {
+                return Err(Error::msg(
+                    "allow --do-nothing cannot be combined with read/write grant options",
+                ));
+            }
+            print_response(send(
+                runtime,
+                &name,
+                &Request::Allow {
+                    name: name.clone(),
+                    id,
+                    do_nothing,
+                    grant,
+                },
+            )?)
+        }
         SandboxCommand::Deny { id } => print_response(send(
             runtime,
             &name,
@@ -293,6 +321,57 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
             &name,
             &Request::Metadata { name: name.clone() },
         )?),
+    }
+}
+
+fn parse_read_write_grant_options(
+    path: Option<String>,
+    duration: Option<String>,
+    tree: bool,
+) -> Result<Option<ReadWriteGrantOptions>> {
+    if path.is_none() && duration.is_none() && !tree {
+        return Ok(None);
+    }
+    let lifetime = match duration {
+        Some(value) => ReadWriteGrantLifetimeRequest::Duration {
+            seconds: parse_duration_seconds(&value)?,
+        },
+        None => ReadWriteGrantLifetimeRequest::OneShot,
+    };
+    Ok(Some(ReadWriteGrantOptions {
+        path: path.map(SandboxPath::new).transpose()?,
+        lifetime,
+        tree,
+    }))
+}
+
+fn parse_duration_seconds(value: &str) -> Result<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(DEFAULT_READ_WRITE_GRANT_DURATION.as_secs());
+    }
+    let (number, unit) = value
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map_or((value, ""), |(index, _)| value.split_at(index));
+    if number.is_empty() || !unit.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return Err(Error::msg(format!("invalid duration: {value}")));
+    }
+    let amount: u64 = number
+        .parse()
+        .map_err(|_| Error::msg(format!("invalid duration: {value}")))?;
+    if amount == 0 {
+        return Err(Error::msg("duration must be greater than zero"));
+    }
+    match unit {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => Ok(amount),
+        "m" | "min" | "mins" | "minute" | "minutes" => amount
+            .checked_mul(60)
+            .ok_or_else(|| Error::msg(format!("duration is too large: {value}"))),
+        "h" | "hr" | "hrs" | "hour" | "hours" => amount
+            .checked_mul(60 * 60)
+            .ok_or_else(|| Error::msg(format!("duration is too large: {value}"))),
+        _ => Err(Error::msg(format!("invalid duration unit: {unit}"))),
     }
 }
 
@@ -344,6 +423,12 @@ fn print_response(response: Response) -> Result<i32> {
         Response::Text { text } => {
             if !text.is_empty() {
                 println!("{text}");
+            }
+            Ok(0)
+        }
+        Response::Warning { message } => {
+            if !message.is_empty() {
+                eprintln!("warning: {message}");
             }
             Ok(0)
         }
@@ -433,6 +518,12 @@ fn run_trusted_command(
             let _ = fs::remove_dir(&mountpoint);
             return Err(Error::msg(message));
         }
+        Response::Warning { message } => {
+            let _ = fs::remove_dir(&mountpoint);
+            return Err(Error::msg(format!(
+                "unexpected warning response while beginning trusted operation: {message}"
+            )));
+        }
         other => {
             let _ = fs::remove_dir(&mountpoint);
             return Err(Error::msg(format!(
@@ -508,6 +599,13 @@ fn run_trusted_command(
             cleanup_trusted_lossy(runtime, name, &token);
             return Err(Error::msg(message));
         }
+        Response::Warning { message } => {
+            kill_release_wait(child_pid, write_raw_fd);
+            cleanup_trusted_lossy(runtime, name, &token);
+            return Err(Error::msg(format!(
+                "unexpected warning response while registering trusted pid: {message}"
+            )));
+        }
         other => {
             kill_release_wait(child_pid, write_raw_fd);
             cleanup_trusted_lossy(runtime, name, &token);
@@ -568,6 +666,9 @@ fn cleanup_trusted(runtime: &RuntimePaths, name: &str, token: &str) -> Result<()
     )? {
         Response::Ok => Ok(()),
         Response::Error { message } => Err(Error::msg(message)),
+        Response::Warning { message } => Err(Error::msg(format!(
+            "unexpected warning response while ending trusted operation: {message}"
+        ))),
         other => Err(Error::msg(format!(
             "unexpected session response: {other:?}"
         ))),
@@ -747,6 +848,11 @@ fn monitor(runtime: &RuntimePaths, name: &str, follow: bool) -> Result<i32> {
     let path = match response {
         Response::Text { text } => PathBuf::from(text),
         Response::Error { message } => return Err(Error::msg(message)),
+        Response::Warning { message } => {
+            return Err(Error::msg(format!(
+                "unexpected warning response while resolving log path: {message}"
+            )));
+        }
         other => {
             return Err(Error::msg(format!(
                 "unexpected session response: {other:?}"
@@ -846,6 +952,37 @@ mod tests {
         assert_eq!(tail_lines(data, 2), "three\nfour\n");
         assert_eq!(tail_lines(data, 10), data);
         assert_eq!(tail_lines(data, 0), "");
+    }
+
+    #[test]
+    fn read_write_grant_options_are_explicit_and_default_to_one_shot() {
+        assert!(
+            parse_read_write_grant_options(None, None, false)
+                .unwrap()
+                .is_none()
+        );
+
+        let options = parse_read_write_grant_options(Some("/secret/**".to_string()), None, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(options.path, Some(SandboxPath::new("/secret/**").unwrap()));
+        assert_eq!(options.lifetime, ReadWriteGrantLifetimeRequest::OneShot);
+        assert!(options.tree);
+    }
+
+    #[test]
+    fn read_write_grant_duration_parser_supports_default_and_units() {
+        let options = parse_read_write_grant_options(None, Some("30m".to_string()), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            options.lifetime,
+            ReadWriteGrantLifetimeRequest::Duration { seconds: 30 * 60 }
+        );
+        assert_eq!(parse_duration_seconds("5").unwrap(), 5);
+        assert_eq!(parse_duration_seconds("2h").unwrap(), 2 * 60 * 60);
+        assert!(parse_duration_seconds("0").is_err());
+        assert!(parse_duration_seconds("1d").is_err());
     }
 
     #[test]

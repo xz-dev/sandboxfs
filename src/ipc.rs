@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::path::SandboxPath;
-use crate::state::{PendingRequest, ProtectionKind, ProtectionRule, TrustedPathScope};
+use crate::state::{
+    PendingRequest, ProtectionKind, ProtectionRule, ReadWriteGrantOptions, TrustedPathScope,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -81,6 +83,8 @@ pub enum Request {
         name: String,
         id: u64,
         do_nothing: bool,
+        #[serde(default)]
+        grant: Option<ReadWriteGrantOptions>,
     },
     Deny {
         name: String,
@@ -105,6 +109,9 @@ pub enum Response {
     Ok,
     Text {
         text: String,
+    },
+    Warning {
+        message: String,
     },
     Pending {
         items: Vec<PendingRequest>,

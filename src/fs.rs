@@ -17,8 +17,9 @@ use fuser::{
 
 use crate::log;
 use crate::path::SandboxPath;
+use crate::process_info::{ProcessInfoProvider, SysinfoProcessInfoProvider};
 use crate::state::{
-    FS_IMMUTABLE_FL, MetadataOperation, PendingDecision, PendingMetadataRequest,
+    FS_IMMUTABLE_FL, GrantMatchOutcome, MetadataOperation, PendingDecision, PendingMetadataRequest,
     PendingReadWriteRequest, PendingWaiter, ReadWriteOperation,
     RequesterIdentity as RequestIdentity, ResolvedPath, SandboxRegistry, TTL, apply_override,
     mode_to_kind, stable_ino, virtual_dir_attr,
@@ -371,6 +372,54 @@ impl SandboxFs {
             return Ok(ReadWriteDecision::Proceed);
         };
         let log_path = sandbox.log_path.clone();
+        let process_identity = SysinfoProcessInfoProvider.identity_for_pid(identity.pid);
+        let now = SystemTime::now();
+        let expired_events: Vec<(u64, u64)> = registry
+            .prune_expired_read_write_grants_for_sandbox(&self.sandbox_name, now)
+            .into_iter()
+            .map(|grant| (registry.next_operation_id(), grant.id))
+            .collect();
+        match registry.match_read_write_grant_for_intent(
+            &self.sandbox_name,
+            kind,
+            &protected_path,
+            process_identity,
+            now,
+        ) {
+            GrantMatchOutcome::Matched { grant_id, consumed } => {
+                let consumed_event_id = consumed.then(|| registry.next_operation_id());
+                drop(registry);
+                for (event_id, grant_id) in expired_events {
+                    let _ = self.log_writer.append(
+                        &log_path,
+                        log::format_log_line(
+                            event_id,
+                            &format!("grant-expired grant={grant_id} lifetime=duration"),
+                        ),
+                    );
+                }
+                if let Some(event_id) = consumed_event_id {
+                    let _ = self.log_writer.append(
+                        &log_path,
+                        log::format_log_line(
+                            event_id,
+                            &format!("grant-consumed grant={grant_id} lifetime=one-shot"),
+                        ),
+                    );
+                }
+                return Ok(ReadWriteDecision::Proceed);
+            }
+            GrantMatchOutcome::NotMatched => {}
+        }
+        for (event_id, grant_id) in expired_events {
+            let _ = self.log_writer.append(
+                &log_path,
+                log::format_log_line(
+                    event_id,
+                    &format!("grant-expired grant={grant_id} lifetime=duration"),
+                ),
+            );
+        }
         let waiter: PendingWaiter = Arc::new((Mutex::new(None), Condvar::new()));
         let id = registry.next_operation_id();
         self.log_writer
@@ -385,14 +434,17 @@ impl SandboxFs {
                 ),
             )
             .map_err(|_| Errno::EIO)?;
-        registry.insert_pending_read_write_request(PendingReadWriteRequest::new_with_attach_path(
-            id,
-            self.sandbox_name.clone(),
-            self.attach_id,
-            operation,
-            protected_path,
-            identity,
-        ));
+        registry.insert_pending_read_write_request(
+            PendingReadWriteRequest::new_with_attach_path(
+                id,
+                self.sandbox_name.clone(),
+                self.attach_id,
+                operation,
+                protected_path,
+                identity,
+            )
+            .with_process_identity(process_identity),
+        );
         registry.pending_waiters.insert(id, Arc::clone(&waiter));
         drop(registry);
 
@@ -1075,7 +1127,8 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::state::{
-        ProtectionKind, ReadWriteOperation, Sandbox, TrustedOperation, TrustedPathScope,
+        ProtectionKind, ReadWriteAccessGrant, ReadWriteGrantLifetime, ReadWriteGrantSubject,
+        ReadWriteOperation, Sandbox, TrustedOperation, TrustedPathScope, epoch_millis,
     };
 
     fn registry_with_file(temp: &TempDir, log_path: PathBuf) -> Arc<Mutex<SandboxRegistry>> {
@@ -1236,6 +1289,159 @@ mod tests {
 
         resolve_pending_read_write(&registry, id, PendingDecision::Apply);
         assert_eq!(worker.join().unwrap().unwrap(), ReadWriteDecision::Proceed);
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn protected_read_matching_duration_grant_proceeds_without_pending_request() {
+        let temp = TempDir::new().unwrap();
+        let log_path = temp.path().join("logs/demo.log");
+        let registry = registry_with_file(&temp, log_path.clone());
+        let identity = SysinfoProcessInfoProvider
+            .identity_for_pid(std::process::id())
+            .unwrap();
+        {
+            let mut registry = registry.lock().unwrap();
+            registry
+                .sandboxes
+                .get_mut("demo")
+                .unwrap()
+                .protect(ProtectionKind::Read, SandboxPath::new("/data/**").unwrap());
+            registry.insert_read_write_grant(ReadWriteAccessGrant {
+                id: 42,
+                sandbox: "demo".to_string(),
+                kind: ProtectionKind::Read,
+                path_pattern: SandboxPath::new("/data/**").unwrap(),
+                subject: ReadWriteGrantSubject::Exact { identity },
+                lifetime: ReadWriteGrantLifetime::Duration {
+                    expires_at_epoch_ms: epoch_millis(SystemTime::now() + Duration::from_secs(60)),
+                },
+                created_at_epoch_ms: epoch_millis(SystemTime::now()),
+            });
+        }
+        let writer = log::LogWriter::new();
+        let fs = SandboxFs::new("demo", Arc::clone(&registry), writer.handle());
+
+        let decision = fs
+            .authorize_read_write(
+                RequestIdentity {
+                    pid: std::process::id(),
+                    uid: 1000,
+                    gid: 1000,
+                },
+                ReadWriteOperation::ReadFile {
+                    path: SandboxPath::new("/data/file").unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, ReadWriteDecision::Proceed);
+        assert!(registry.lock().unwrap().pending_read_write.is_empty());
+        assert!(log::read_log(&log_path).unwrap_or_default().is_empty());
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn protected_read_matching_one_shot_grant_is_consumed() {
+        let temp = TempDir::new().unwrap();
+        let log_path = temp.path().join("logs/demo.log");
+        let registry = registry_with_file(&temp, log_path.clone());
+        let identity = SysinfoProcessInfoProvider
+            .identity_for_pid(std::process::id())
+            .unwrap();
+        {
+            let mut registry = registry.lock().unwrap();
+            registry.sandboxes.get_mut("demo").unwrap().protect(
+                ProtectionKind::Read,
+                SandboxPath::new("/data/file").unwrap(),
+            );
+            registry.insert_read_write_grant(ReadWriteAccessGrant {
+                id: 42,
+                sandbox: "demo".to_string(),
+                kind: ProtectionKind::Read,
+                path_pattern: SandboxPath::new("/data/file").unwrap(),
+                subject: ReadWriteGrantSubject::Exact { identity },
+                lifetime: ReadWriteGrantLifetime::OneShot,
+                created_at_epoch_ms: epoch_millis(SystemTime::now()),
+            });
+        }
+        let writer = log::LogWriter::new();
+        let fs = SandboxFs::new("demo", Arc::clone(&registry), writer.handle());
+
+        let decision = fs
+            .authorize_read_write(
+                RequestIdentity {
+                    pid: std::process::id(),
+                    uid: 1000,
+                    gid: 1000,
+                },
+                ReadWriteOperation::ReadFile {
+                    path: SandboxPath::new("/data/file").unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, ReadWriteDecision::Proceed);
+        assert!(registry.lock().unwrap().pending_read_write.is_empty());
+        assert!(registry.lock().unwrap().read_write_grants.is_empty());
+        let data = log::read_log(&log_path).unwrap();
+        assert!(data.contains("grant-consumed grant=42 lifetime=one-shot"));
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn protected_read_expired_duration_grant_is_pruned_and_request_queues() {
+        let temp = TempDir::new().unwrap();
+        let log_path = temp.path().join("logs/demo.log");
+        let registry = registry_with_file(&temp, log_path.clone());
+        let identity = SysinfoProcessInfoProvider
+            .identity_for_pid(std::process::id())
+            .unwrap();
+        {
+            let mut registry = registry.lock().unwrap();
+            registry.sandboxes.get_mut("demo").unwrap().protect(
+                ProtectionKind::Read,
+                SandboxPath::new("/data/file").unwrap(),
+            );
+            registry.insert_read_write_grant(ReadWriteAccessGrant {
+                id: 42,
+                sandbox: "demo".to_string(),
+                kind: ProtectionKind::Read,
+                path_pattern: SandboxPath::new("/data/file").unwrap(),
+                subject: ReadWriteGrantSubject::Exact { identity },
+                lifetime: ReadWriteGrantLifetime::Duration {
+                    expires_at_epoch_ms: 0,
+                },
+                created_at_epoch_ms: epoch_millis(SystemTime::now()),
+            });
+            registry.next_operation_id = 50;
+        }
+        let writer = log::LogWriter::new();
+        let fs = SandboxFs::new("demo", Arc::clone(&registry), writer.handle());
+
+        let worker = {
+            let fs = fs.clone();
+            thread::spawn(move || {
+                fs.authorize_read_write(
+                    RequestIdentity {
+                        pid: std::process::id(),
+                        uid: 1000,
+                        gid: 1000,
+                    },
+                    ReadWriteOperation::ReadFile {
+                        path: SandboxPath::new("/data/file").unwrap(),
+                    },
+                )
+            })
+        };
+
+        let id = wait_for_pending_read_write(&registry);
+        let data = log::read_log(&log_path).unwrap();
+        assert!(data.contains(" id=50 grant-expired grant=42 lifetime=duration"));
+        assert!(data.contains(&format!(" id={id} pending path=/data/file READ file")));
+        resolve_pending_read_write(&registry, id, PendingDecision::Apply);
+        assert_eq!(worker.join().unwrap().unwrap(), ReadWriteDecision::Proceed);
+        assert!(registry.lock().unwrap().read_write_grants.is_empty());
         writer.shutdown().unwrap();
     }
 

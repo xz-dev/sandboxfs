@@ -22,6 +22,7 @@ pub fn run(name: String) -> Result<i32> {
     match send(&runtime, &name, &Request::Pending { name: name.clone() })? {
         Response::Pending { .. } => {}
         Response::Error { message } => return Err(Error::msg(message)),
+        Response::Warning { message } => return Err(Error::msg(message)),
         other => {
             return Err(Error::msg(format!(
                 "unexpected session response: {other:?}"
@@ -56,6 +57,7 @@ where
         )? {
             Response::Pending { items } => items,
             Response::Error { message } => return Err(Error::msg(message)),
+            Response::Warning { message } => return Err(Error::msg(message)),
             other => {
                 return Err(Error::msg(format!(
                     "unexpected session response: {other:?}"
@@ -133,11 +135,13 @@ pub fn resolve_pending_action(
             name: name.to_string(),
             id,
             do_nothing: false,
+            grant: None,
         },
         PendingAction::DoNothing => Request::Allow {
             name: name.to_string(),
             id,
             do_nothing: true,
+            grant: None,
         },
         PendingAction::Deny => Request::Deny {
             name: name.to_string(),
@@ -371,6 +375,7 @@ fn send(runtime: &RuntimePaths, name: &str, request: &Request) -> Result<Respons
 fn response_message(response: Response) -> String {
     match response {
         Response::Ok => "ok".to_string(),
+        Response::Warning { message } => format!("warning: {message}"),
         Response::Error { message } => message,
         other => format!("{other:?}"),
     }

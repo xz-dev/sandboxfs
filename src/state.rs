@@ -9,6 +9,7 @@ use fuser::{FileAttr, FileType, INodeNo};
 use serde::{Deserialize, Serialize};
 
 use crate::path::SandboxPath;
+use crate::process_info::ProcessIdentityEvidence;
 use crate::{Error, Result};
 
 pub const ROOT_INO: u64 = 1;
@@ -391,6 +392,7 @@ pub struct PendingReadWriteRequest {
     pub pid: u32,
     pub uid: u32,
     pub gid: u32,
+    pub process_identity: Option<ProcessIdentityEvidence>,
     pub description: String,
 }
 
@@ -445,8 +447,138 @@ impl PendingReadWriteRequest {
             pid: requester.pid,
             uid: requester.uid,
             gid: requester.gid,
+            process_identity: None,
         }
     }
+
+    pub fn with_process_identity(mut self, identity: Option<ProcessIdentityEvidence>) -> Self {
+        self.process_identity = identity;
+        self
+    }
+}
+
+pub const DEFAULT_READ_WRITE_GRANT_DURATION: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadWriteGrantLifetimeRequest {
+    OneShot,
+    Duration { seconds: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadWriteGrantOptions {
+    pub path: Option<SandboxPath>,
+    pub lifetime: ReadWriteGrantLifetimeRequest,
+    pub tree: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadWriteGrantLifetime {
+    OneShot,
+    Duration { expires_at_epoch_ms: u128 },
+}
+
+impl ReadWriteGrantLifetime {
+    pub fn log_name(self) -> &'static str {
+        match self {
+            Self::OneShot => "one-shot",
+            Self::Duration { .. } => "duration",
+        }
+    }
+
+    pub fn is_expired(self, now: SystemTime) -> bool {
+        match self {
+            Self::OneShot => false,
+            Self::Duration {
+                expires_at_epoch_ms,
+            } => epoch_millis(now) >= expires_at_epoch_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "subject", rename_all = "snake_case")]
+pub enum ReadWriteGrantSubject {
+    Exact {
+        identity: ProcessIdentityEvidence,
+    },
+    ProcessTree {
+        identities: Vec<ProcessIdentityEvidence>,
+    },
+}
+
+impl ReadWriteGrantSubject {
+    pub fn log_name(&self) -> &'static str {
+        match self {
+            Self::Exact { .. } => "exact",
+            Self::ProcessTree { .. } => "process-tree",
+        }
+    }
+
+    pub fn matches(&self, identity: Option<ProcessIdentityEvidence>) -> bool {
+        let Some(identity) = identity else {
+            return false;
+        };
+        match self {
+            Self::Exact { identity: expected } => *expected == identity,
+            Self::ProcessTree { identities } => identities.contains(&identity),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Exact { .. } => 1,
+            Self::ProcessTree { identities } => identities.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadWriteAccessGrant {
+    pub id: u64,
+    pub sandbox: String,
+    pub kind: ProtectionKind,
+    pub path_pattern: SandboxPath,
+    pub subject: ReadWriteGrantSubject,
+    pub lifetime: ReadWriteGrantLifetime,
+    pub created_at_epoch_ms: u128,
+}
+
+impl ReadWriteAccessGrant {
+    pub fn matches_request(&self, request: &PendingReadWriteRequest, now: SystemTime) -> bool {
+        self.sandbox == request.sandbox
+            && self.kind == request.kind
+            && !self.lifetime.is_expired(now)
+            && grant_pattern_matches(&self.path_pattern, &request.path)
+            && self.subject.matches(request.process_identity)
+    }
+
+    pub fn matches_intent(
+        &self,
+        sandbox: &str,
+        kind: ProtectionKind,
+        path: &SandboxPath,
+        identity: Option<ProcessIdentityEvidence>,
+        now: SystemTime,
+    ) -> bool {
+        self.sandbox == sandbox
+            && self.kind == kind
+            && !self.lifetime.is_expired(now)
+            && grant_pattern_matches(&self.path_pattern, path)
+            && self.subject.matches(identity)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantMatchOutcome {
+    Matched { grant_id: u64, consumed: bool },
+    NotMatched,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,6 +952,7 @@ pub struct SandboxRegistry {
     pub pending_waiters: HashMap<u64, PendingWaiter>,
     pub pending_index: BTreeMap<PendingOperationKey, u64>,
     pub trusted: HashMap<String, TrustedOperation>,
+    pub read_write_grants: BTreeMap<u64, ReadWriteAccessGrant>,
     pub next_operation_id: u64,
 }
 
@@ -904,6 +1037,66 @@ impl SandboxRegistry {
         items.sort_by_key(PendingRequest::id);
         items
     }
+
+    pub fn insert_read_write_grant(&mut self, grant: ReadWriteAccessGrant) {
+        self.read_write_grants.insert(grant.id, grant);
+    }
+
+    pub fn prune_expired_read_write_grants_for_sandbox(
+        &mut self,
+        sandbox: &str,
+        now: SystemTime,
+    ) -> Vec<ReadWriteAccessGrant> {
+        let ids: Vec<u64> = self
+            .read_write_grants
+            .iter()
+            .filter_map(|(id, grant)| {
+                (grant.sandbox == sandbox && grant.lifetime.is_expired(now)).then_some(*id)
+            })
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| self.read_write_grants.remove(&id))
+            .collect()
+    }
+
+    pub fn match_read_write_grant_for_intent(
+        &mut self,
+        sandbox: &str,
+        kind: ProtectionKind,
+        path: &SandboxPath,
+        identity: Option<ProcessIdentityEvidence>,
+        now: SystemTime,
+    ) -> GrantMatchOutcome {
+        let Some(grant_id) = self.read_write_grants.iter().find_map(|(id, grant)| {
+            grant
+                .matches_intent(sandbox, kind, path, identity, now)
+                .then_some(*id)
+        }) else {
+            return GrantMatchOutcome::NotMatched;
+        };
+        let consumed = matches!(
+            self.read_write_grants
+                .get(&grant_id)
+                .map(|grant| grant.lifetime),
+            Some(ReadWriteGrantLifetime::OneShot)
+        );
+        if consumed {
+            self.read_write_grants.remove(&grant_id);
+        }
+        GrantMatchOutcome::Matched { grant_id, consumed }
+    }
+
+    pub fn matching_pending_read_write_ids_for_grant(
+        &self,
+        grant: &ReadWriteAccessGrant,
+        now: SystemTime,
+    ) -> Vec<u64> {
+        self.pending_read_write
+            .values()
+            .filter(|request| grant.matches_request(request, now))
+            .map(|request| request.id)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -925,7 +1118,17 @@ pub fn stable_ino(path: &SandboxPath) -> INodeNo {
     INodeNo(FIRST_DYNAMIC_INO + (hash & 0x000f_ffff_ffff_ffff))
 }
 
+pub fn grant_pattern_matches(pattern: &SandboxPath, path: &SandboxPath) -> bool {
+    let pattern_components = sandbox_path_components(pattern);
+    let path_components = sandbox_path_components(path);
+    matches_pattern_components(&pattern_components, &path_components)
+}
+
 fn protected_pattern_matches(pattern: &SandboxPath, path: &SandboxPath) -> bool {
+    matches_protection_pattern(pattern, path)
+}
+
+fn matches_protection_pattern(pattern: &SandboxPath, path: &SandboxPath) -> bool {
     let pattern_components = sandbox_path_components(pattern);
     let path_components = sandbox_path_components(path);
     if matches_pattern_components(&pattern_components, &path_components) {
@@ -966,6 +1169,18 @@ fn matches_pattern_components(pattern: &[String], path: &[String]) -> bool {
             }
         }
     }
+}
+
+pub fn epoch_millis(time: SystemTime) -> u128 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+pub fn duration_expires_at(now: SystemTime, duration: Duration) -> u128 {
+    now.checked_add(duration)
+        .map(epoch_millis)
+        .unwrap_or(u128::MAX)
 }
 
 fn component_pattern_matches(pattern: &str, value: &str) -> bool {
@@ -1260,6 +1475,136 @@ mod tests {
         assert_eq!(
             rename.event_body(),
             "path=/data/old WRITE rename to=/data/new"
+        );
+    }
+
+    #[test]
+    fn grant_patterns_use_plain_glob_semantics_without_protection_subtree_shortcut() {
+        assert!(grant_pattern_matches(
+            &SandboxPath::new("/secret/*").unwrap(),
+            &SandboxPath::new("/secret/file").unwrap()
+        ));
+        assert!(!grant_pattern_matches(
+            &SandboxPath::new("/secret/*").unwrap(),
+            &SandboxPath::new("/secret").unwrap()
+        ));
+        assert!(!grant_pattern_matches(
+            &SandboxPath::new("/secret/*").unwrap(),
+            &SandboxPath::new("/secret/a/b").unwrap()
+        ));
+        assert!(grant_pattern_matches(
+            &SandboxPath::new("/secret/**").unwrap(),
+            &SandboxPath::new("/secret/a/b").unwrap()
+        ));
+    }
+
+    #[test]
+    fn registry_matches_grants_by_kind_path_and_requester_identity() {
+        let mut registry = SandboxRegistry::new();
+        let identity = ProcessIdentityEvidence {
+            pid: 123,
+            start_time: 456,
+        };
+        registry.insert_read_write_grant(ReadWriteAccessGrant {
+            id: 7,
+            sandbox: "s".to_string(),
+            kind: ProtectionKind::Read,
+            path_pattern: SandboxPath::new("/data/**").unwrap(),
+            subject: ReadWriteGrantSubject::Exact { identity },
+            lifetime: ReadWriteGrantLifetime::Duration {
+                expires_at_epoch_ms: duration_expires_at(
+                    SystemTime::now(),
+                    Duration::from_secs(60),
+                ),
+            },
+            created_at_epoch_ms: epoch_millis(SystemTime::now()),
+        });
+
+        assert_eq!(
+            registry.match_read_write_grant_for_intent(
+                "s",
+                ProtectionKind::Read,
+                &SandboxPath::new("/data/file").unwrap(),
+                Some(identity),
+                SystemTime::now(),
+            ),
+            GrantMatchOutcome::Matched {
+                grant_id: 7,
+                consumed: false
+            }
+        );
+        assert_eq!(
+            registry.match_read_write_grant_for_intent(
+                "s",
+                ProtectionKind::Write,
+                &SandboxPath::new("/data/file").unwrap(),
+                Some(identity),
+                SystemTime::now(),
+            ),
+            GrantMatchOutcome::NotMatched
+        );
+        assert_eq!(
+            registry.match_read_write_grant_for_intent(
+                "s",
+                ProtectionKind::Read,
+                &SandboxPath::new("/other/file").unwrap(),
+                Some(identity),
+                SystemTime::now(),
+            ),
+            GrantMatchOutcome::NotMatched
+        );
+        assert_eq!(
+            registry.match_read_write_grant_for_intent(
+                "s",
+                ProtectionKind::Read,
+                &SandboxPath::new("/data/file").unwrap(),
+                None,
+                SystemTime::now(),
+            ),
+            GrantMatchOutcome::NotMatched
+        );
+    }
+
+    #[test]
+    fn one_shot_grants_are_consumed_on_first_match() {
+        let mut registry = SandboxRegistry::new();
+        let identity = ProcessIdentityEvidence {
+            pid: 123,
+            start_time: 456,
+        };
+        registry.insert_read_write_grant(ReadWriteAccessGrant {
+            id: 7,
+            sandbox: "s".to_string(),
+            kind: ProtectionKind::Read,
+            path_pattern: SandboxPath::new("/data/file").unwrap(),
+            subject: ReadWriteGrantSubject::Exact { identity },
+            lifetime: ReadWriteGrantLifetime::OneShot,
+            created_at_epoch_ms: epoch_millis(SystemTime::now()),
+        });
+
+        assert_eq!(
+            registry.match_read_write_grant_for_intent(
+                "s",
+                ProtectionKind::Read,
+                &SandboxPath::new("/data/file").unwrap(),
+                Some(identity),
+                SystemTime::now(),
+            ),
+            GrantMatchOutcome::Matched {
+                grant_id: 7,
+                consumed: true
+            }
+        );
+        assert!(registry.read_write_grants.is_empty());
+        assert_eq!(
+            registry.match_read_write_grant_for_intent(
+                "s",
+                ProtectionKind::Read,
+                &SandboxPath::new("/data/file").unwrap(),
+                Some(identity),
+                SystemTime::now(),
+            ),
+            GrantMatchOutcome::NotMatched
         );
     }
 

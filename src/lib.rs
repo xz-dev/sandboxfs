@@ -3,6 +3,7 @@ pub mod fs;
 pub mod ipc;
 pub mod log;
 pub mod path;
+pub mod process_info;
 pub mod runtime;
 pub mod session;
 pub mod state;

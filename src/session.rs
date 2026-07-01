@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use fuser::{Config, MountOption};
 
@@ -16,10 +16,13 @@ use crate::fs::SandboxFs;
 use crate::ipc::{self, Request, Response};
 use crate::log;
 use crate::path::SandboxPath;
+use crate::process_info::{ProcessInfoProvider, SysinfoProcessInfoProvider};
 use crate::runtime::RuntimePaths;
 use crate::state::{
-    AttachMount, PendingDecision, PendingRequest, PendingWaiter, ProtectionKind, Sandbox,
-    SandboxRegistry, TrustedOperation, TrustedPathScope,
+    AttachMount, PendingDecision, PendingRequest, PendingWaiter, ProtectionKind,
+    ReadWriteAccessGrant, ReadWriteGrantLifetime, ReadWriteGrantLifetimeRequest,
+    ReadWriteGrantOptions, ReadWriteGrantSubject, Sandbox, SandboxRegistry, TrustedOperation,
+    TrustedPathScope, duration_expires_at, grant_pattern_matches,
 };
 use crate::{Error, Result};
 
@@ -37,6 +40,28 @@ struct CanceledPending {
     event_id: u64,
     attach_id: Option<u64>,
     waiter: Option<PendingWaiter>,
+}
+
+#[derive(Debug)]
+struct ReleasedReadWritePending {
+    id: u64,
+    attach_id: Option<u64>,
+    release_event_id: Option<u64>,
+    waiter: Option<PendingWaiter>,
+}
+
+#[derive(Debug)]
+struct GrantAllowOutcome {
+    decision_id: u64,
+    grant_event_id: Option<u64>,
+    consumed_event_id: Option<u64>,
+    log_path: PathBuf,
+    request_id: u64,
+    request_attach_id: Option<u64>,
+    released: Vec<ReleasedReadWritePending>,
+    grant: Option<ReadWriteAccessGrant>,
+    warning: Option<String>,
+    downgraded: bool,
 }
 
 #[derive(Debug)]
@@ -142,7 +167,8 @@ impl SessionState {
                 name,
                 id,
                 do_nothing,
-            } => self.allow(&name, id, do_nothing),
+                grant,
+            } => self.allow(&name, id, do_nothing, grant),
             Request::Deny { name, id } => self.deny(&name, id),
             Request::Cancel { name, id } => self.cancel(&name, id, "explicit"),
             Request::CancelAll { name, mountpoint } => {
@@ -526,7 +552,22 @@ impl SessionState {
         Ok(Response::Pending { items })
     }
 
-    fn allow(&self, name: &str, id: u64, do_nothing: bool) -> Result<Response> {
+    fn allow(
+        &self,
+        name: &str,
+        id: u64,
+        do_nothing: bool,
+        grant: Option<ReadWriteGrantOptions>,
+    ) -> Result<Response> {
+        if do_nothing && grant.is_some() {
+            return Err(Error::msg(
+                "allow --do-nothing cannot be combined with read/write grant options",
+            ));
+        }
+        if let Some(grant) = grant {
+            return self.allow_read_write_grant(name, id, grant);
+        }
+
         let mut registry = self.registry.lock().unwrap();
         let pending = registry
             .remove_any_pending_request(id)
@@ -583,6 +624,330 @@ impl SessionState {
         );
         log_result?;
         Ok(Response::Ok)
+    }
+
+    fn allow_read_write_grant(
+        &self,
+        name: &str,
+        id: u64,
+        options: ReadWriteGrantOptions,
+    ) -> Result<Response> {
+        if matches!(
+            options.lifetime,
+            ReadWriteGrantLifetimeRequest::Duration { seconds: 0 }
+        ) {
+            return Err(Error::msg("duration must be greater than zero"));
+        }
+        let process_provider = SysinfoProcessInfoProvider;
+        let now = SystemTime::now();
+        let outcome = (|| -> Result<GrantAllowOutcome> {
+            let mut registry = self.registry.lock().unwrap();
+            let selected = registry
+                .remove_any_pending_request(id)
+                .ok_or_else(|| Error::msg(format!("pending operation not found: {id}")))?;
+            if selected.sandbox() != name {
+                registry.insert_any_pending_request(selected);
+                return Err(Error::msg(format!(
+                    "pending operation {id} does not belong to sandbox {name}"
+                )));
+            }
+            let PendingRequest::ReadWrite(mut selected) = selected else {
+                registry.insert_any_pending_request(selected);
+                return Err(Error::msg(
+                    "read/write grant options can only be used with read/write pending requests",
+                ));
+            };
+            let log_path = registry
+                .sandboxes
+                .get(name)
+                .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?
+                .log_path
+                .clone();
+            let decision_id = registry.next_operation_id();
+            let mut selected_waiter = registry.pending_waiters.remove(&id);
+            let request_attach_id = selected.attach_id;
+            let grant_path = options.path.unwrap_or_else(|| selected.path.clone());
+            if !grant_pattern_matches(&grant_path, &selected.path) {
+                let message = format!(
+                    "read/write grant path {grant_path} does not match pending path {}",
+                    selected.path
+                );
+                registry.insert_pending_read_write_request(selected);
+                if let Some(waiter) = selected_waiter {
+                    registry.pending_waiters.insert(id, waiter);
+                }
+                return Err(Error::msg(message));
+            }
+            let mut warning = None;
+            let mut downgraded = false;
+            let selected_identity = selected.process_identity;
+            let exact_identity =
+                || selected_identity.or_else(|| process_provider.identity_for_pid(selected.pid));
+            let subject = if options.tree {
+                match process_provider.process_tree_for_pid(selected.pid) {
+                    Some(identities) if !identities.is_empty() => {
+                        let requester_identity = selected.process_identity.or_else(|| {
+                            identities
+                                .iter()
+                                .find(|identity| identity.pid == selected.pid)
+                                .copied()
+                        });
+                        match requester_identity {
+                            Some(identity) if identities.contains(&identity) => {
+                                selected.process_identity.get_or_insert(identity);
+                                Some(ReadWriteGrantSubject::ProcessTree { identities })
+                            }
+                            Some(identity) => {
+                                selected.process_identity.get_or_insert(identity);
+                                warning = Some(format!(
+                                    "process tree unavailable for pid {}; using exact requester grant",
+                                    selected.pid
+                                ));
+                                Some(ReadWriteGrantSubject::Exact { identity })
+                            }
+                            None => match exact_identity() {
+                                Some(identity) => {
+                                    selected.process_identity.get_or_insert(identity);
+                                    warning = Some(format!(
+                                        "process tree unavailable for pid {}; using exact requester grant",
+                                        selected.pid
+                                    ));
+                                    Some(ReadWriteGrantSubject::Exact { identity })
+                                }
+                                None => {
+                                    warning = Some(format!(
+                                        "requester identity unavailable for pid {}; released current request without creating grant",
+                                        selected.pid
+                                    ));
+                                    downgraded = true;
+                                    None
+                                }
+                            },
+                        }
+                    }
+                    _ => match exact_identity() {
+                        Some(identity) => {
+                            selected.process_identity.get_or_insert(identity);
+                            warning = Some(format!(
+                                "process tree unavailable for pid {}; using exact requester grant",
+                                selected.pid
+                            ));
+                            Some(ReadWriteGrantSubject::Exact { identity })
+                        }
+                        None => {
+                            warning = Some(format!(
+                                "requester identity unavailable for pid {}; released current request without creating grant",
+                                selected.pid
+                            ));
+                            downgraded = true;
+                            None
+                        }
+                    },
+                }
+            } else {
+                match exact_identity() {
+                    Some(identity) => {
+                        selected.process_identity.get_or_insert(identity);
+                        Some(ReadWriteGrantSubject::Exact { identity })
+                    }
+                    None => {
+                        warning = Some(format!(
+                            "requester identity unavailable for pid {}; released current request without creating grant",
+                            selected.pid
+                        ));
+                        downgraded = true;
+                        None
+                    }
+                }
+            };
+            let Some(subject) = subject else {
+                return Ok(GrantAllowOutcome {
+                    decision_id,
+                    grant_event_id: None,
+                    consumed_event_id: None,
+                    log_path,
+                    request_id: id,
+                    request_attach_id,
+                    released: vec![ReleasedReadWritePending {
+                        id,
+                        attach_id: request_attach_id,
+                        release_event_id: None,
+                        waiter: selected_waiter.take(),
+                    }],
+                    grant: None,
+                    warning,
+                    downgraded,
+                });
+            };
+            let lifetime = match options.lifetime {
+                ReadWriteGrantLifetimeRequest::OneShot => ReadWriteGrantLifetime::OneShot,
+                ReadWriteGrantLifetimeRequest::Duration { seconds } => {
+                    let duration = Duration::from_secs(seconds);
+                    ReadWriteGrantLifetime::Duration {
+                        expires_at_epoch_ms: duration_expires_at(now, duration),
+                    }
+                }
+            };
+            let grant_id = registry.next_operation_id();
+            let grant_event_id = registry.next_operation_id();
+            let grant = ReadWriteAccessGrant {
+                id: grant_id,
+                sandbox: name.to_string(),
+                kind: selected.kind,
+                path_pattern: grant_path,
+                subject,
+                lifetime,
+                created_at_epoch_ms: crate::state::epoch_millis(now),
+            };
+            let selected_matches_grant = grant.matches_request(&selected, now);
+            let matching_ids = registry.matching_pending_read_write_ids_for_grant(&grant, now);
+            let mut released = Vec::new();
+            let mut selected_released = false;
+            let consumed_event_id = match grant.lifetime {
+                ReadWriteGrantLifetime::OneShot => {
+                    let earliest = matching_ids
+                        .iter()
+                        .copied()
+                        .chain(selected_matches_grant.then_some(id))
+                        .min();
+                    if let Some(release_id) = earliest {
+                        if release_id == id {
+                            selected_released = true;
+                            released.push(ReleasedReadWritePending {
+                                id,
+                                attach_id: request_attach_id,
+                                release_event_id: None,
+                                waiter: selected_waiter.take(),
+                            });
+                        } else if let Some(request) =
+                            registry.remove_pending_read_write_request(release_id)
+                        {
+                            let release_event_id = registry.next_operation_id();
+                            released.push(ReleasedReadWritePending {
+                                id: release_id,
+                                attach_id: request.attach_id,
+                                release_event_id: Some(release_event_id),
+                                waiter: registry.pending_waiters.remove(&release_id),
+                            });
+                        }
+                        Some(registry.next_operation_id())
+                    } else {
+                        registry.insert_read_write_grant(grant.clone());
+                        None
+                    }
+                }
+                ReadWriteGrantLifetime::Duration { .. } => {
+                    if selected_matches_grant {
+                        selected_released = true;
+                        released.push(ReleasedReadWritePending {
+                            id,
+                            attach_id: request_attach_id,
+                            release_event_id: None,
+                            waiter: selected_waiter.take(),
+                        });
+                    }
+                    for release_id in matching_ids {
+                        if let Some(request) =
+                            registry.remove_pending_read_write_request(release_id)
+                        {
+                            let release_event_id = registry.next_operation_id();
+                            released.push(ReleasedReadWritePending {
+                                id: release_id,
+                                attach_id: request.attach_id,
+                                release_event_id: Some(release_event_id),
+                                waiter: registry.pending_waiters.remove(&release_id),
+                            });
+                        }
+                    }
+                    registry.insert_read_write_grant(grant.clone());
+                    None
+                }
+            };
+            if !selected_released {
+                registry.insert_pending_read_write_request(selected);
+                if let Some(waiter) = selected_waiter {
+                    registry.pending_waiters.insert(id, waiter);
+                }
+            }
+            Ok(GrantAllowOutcome {
+                decision_id,
+                grant_event_id: Some(grant_event_id),
+                consumed_event_id,
+                log_path,
+                request_id: id,
+                request_attach_id,
+                released,
+                grant: Some(grant),
+                warning,
+                downgraded,
+            })
+        })()?;
+
+        let response = self.finish_read_write_grant_allow(outcome)?;
+        Ok(response)
+    }
+
+    fn finish_read_write_grant_allow(&self, outcome: GrantAllowOutcome) -> Result<Response> {
+        let selected_attach = format_attach_field(outcome.request_attach_id);
+        let mut decision_body = format!(
+            "decision request={}{} ALLOW",
+            outcome.request_id, selected_attach
+        );
+        if outcome.downgraded {
+            decision_body.push_str(" downgraded=grantless");
+        }
+        if let Some(warning) = &outcome.warning {
+            decision_body.push_str(&format!(" warning={}", quote_log_value(warning)));
+        }
+        let mut log_result = self.log_writer.append(
+            &outcome.log_path,
+            log::format_log_line(outcome.decision_id, &decision_body),
+        );
+
+        if let (Some(event_id), Some(grant)) = (outcome.grant_event_id, outcome.grant.as_ref()) {
+            let grant_result = self.log_writer.append(
+                &outcome.log_path,
+                log::format_log_line(event_id, &format_grant_created_body(grant)),
+            );
+            if log_result.is_ok() && grant_result.is_err() {
+                log_result = grant_result;
+            }
+        }
+        if let (Some(event_id), Some(grant)) = (outcome.consumed_event_id, outcome.grant.as_ref()) {
+            let consumed_result = self.log_writer.append(
+                &outcome.log_path,
+                log::format_log_line(event_id, &format_grant_consumed_body(grant.id)),
+            );
+            if log_result.is_ok() && consumed_result.is_err() {
+                log_result = consumed_result;
+            }
+        }
+
+        for released in outcome.released {
+            if let Some(event_id) = released.release_event_id {
+                let attach_field = format_attach_field(released.attach_id);
+                let release_result = self.log_writer.append(
+                    &outcome.log_path,
+                    log::format_log_line(
+                        event_id,
+                        &format!(
+                            "grant-release request={}{} decision={}",
+                            released.id, attach_field, outcome.request_id
+                        ),
+                    ),
+                );
+                if log_result.is_ok() && release_result.is_err() {
+                    log_result = release_result;
+                }
+            }
+            notify_pending_waiter(released.waiter, PendingDecision::Apply);
+        }
+        log_result?;
+        if let Some(warning) = outcome.warning {
+            Ok(Response::Warning { message: warning })
+        } else {
+            Ok(Response::Ok)
+        }
     }
 
     fn deny(&self, name: &str, id: u64) -> Result<Response> {
@@ -936,6 +1301,40 @@ fn notify_pending_waiter(waiter: Option<crate::state::PendingWaiter>, decision: 
     }
 }
 
+fn format_attach_field(attach_id: Option<u64>) -> String {
+    attach_id
+        .map(|id| format!(" attach={id}"))
+        .unwrap_or_default()
+}
+
+fn quote_log_value(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn format_grant_created_body(grant: &ReadWriteAccessGrant) -> String {
+    let mut body = format!(
+        "grant-created grant={} kind={} path={} subject={} subject_count={} lifetime={}",
+        grant.id,
+        grant.kind,
+        grant.path_pattern,
+        grant.subject.log_name(),
+        grant.subject.len(),
+        grant.lifetime.log_name()
+    );
+    if let ReadWriteGrantLifetime::Duration {
+        expires_at_epoch_ms,
+    } = grant.lifetime
+    {
+        body.push_str(&format!(" expires_at_epoch_ms={expires_at_epoch_ms}"));
+    }
+    body
+}
+
+fn format_grant_consumed_body(grant_id: u64) -> String {
+    format!("grant-consumed grant={grant_id} lifetime=one-shot")
+}
+
 fn canonicalize_existing_dir(path: &Path) -> Result<PathBuf> {
     let canonical = fs::canonicalize(path)?;
     if !canonical.is_dir() {
@@ -1003,6 +1402,7 @@ mod tests {
             name: "a".to_string(),
             id: 1,
             do_nothing: true,
+            grant: None,
         }) {
             Response::Error { message } => assert!(message.contains("log writer stopped")),
             other => panic!("unexpected {other:?}"),
@@ -1036,6 +1436,7 @@ mod tests {
             name: "a".to_string(),
             id: 1,
             do_nothing: false,
+            grant: None,
         }) {
             Response::Ok => {}
             other => panic!("unexpected {other:?}"),
@@ -1054,6 +1455,7 @@ mod tests {
             name: "a".to_string(),
             id: 1,
             do_nothing: true,
+            grant: None,
         }) {
             Response::Ok => {}
             other => panic!("unexpected {other:?}"),
@@ -1134,6 +1536,7 @@ mod tests {
             name: "a".to_string(),
             id: 1,
             do_nothing: false,
+            grant: None,
         }) {
             Response::Ok => {}
             other => panic!("unexpected {other:?}"),
@@ -1154,6 +1557,7 @@ mod tests {
             name: "a".to_string(),
             id: 1,
             do_nothing: true,
+            grant: None,
         }) {
             Response::Ok => {}
             other => panic!("unexpected {other:?}"),
@@ -1163,6 +1567,211 @@ mod tests {
         assert!(data.contains(" id=2 decision request=1 ALLOW_DO_NOTHING"));
         assert_waiter_decision(&waiter, PendingDecision::DoNothing);
         assert_no_pending_read_write_request(&session);
+    }
+
+    #[test]
+    fn grant_options_reject_metadata_requests_without_consuming_them() {
+        let (_temp, session, writer, waiter) = session_with_pending_request_and_writer();
+
+        match session.handle(Request::Allow {
+            name: "a".to_string(),
+            id: 1,
+            do_nothing: false,
+            grant: Some(ReadWriteGrantOptions {
+                path: None,
+                lifetime: ReadWriteGrantLifetimeRequest::OneShot,
+                tree: false,
+            }),
+        }) {
+            Response::Error { message } => assert!(message.contains("read/write grant options")),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        assert_eq!(*waiter.0.lock().unwrap(), None);
+        assert!(session.registry.lock().unwrap().pending.contains_key(&1));
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn read_write_one_shot_grant_consumes_selected_when_it_is_earliest_match() {
+        let (_temp, session, _writer, waiter) =
+            session_with_pending_read_write_request_and_writer();
+
+        match session.handle(Request::Allow {
+            name: "a".to_string(),
+            id: 1,
+            do_nothing: false,
+            grant: Some(ReadWriteGrantOptions {
+                path: None,
+                lifetime: ReadWriteGrantLifetimeRequest::OneShot,
+                tree: false,
+            }),
+        }) {
+            Response::Ok => {}
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let data = log::read_log(&session.runtime.sandbox_log_path("a")).unwrap();
+        assert!(data.contains(" id=2 decision request=1 ALLOW"));
+        assert!(data.contains(" grant-created grant=3 kind=READ path=/data/file subject=exact subject_count=1 lifetime=one-shot"));
+        assert!(data.contains(" grant-consumed grant=3 lifetime=one-shot"));
+        assert_waiter_decision(&waiter, PendingDecision::Apply);
+        let registry = session.registry.lock().unwrap();
+        assert!(registry.pending_read_write.is_empty());
+        assert!(registry.read_write_grants.is_empty());
+    }
+
+    #[test]
+    fn read_write_reusable_grant_downgrades_without_requester_identity() {
+        let (_temp, session, _writer, waiter) =
+            session_with_pending_read_write_request_and_writer();
+        {
+            let mut registry = session.registry.lock().unwrap();
+            let pending = registry.pending_read_write.get_mut(&1).unwrap();
+            pending.pid = u32::MAX;
+            pending.process_identity = None;
+        }
+
+        match session.handle(Request::Allow {
+            name: "a".to_string(),
+            id: 1,
+            do_nothing: false,
+            grant: Some(ReadWriteGrantOptions {
+                path: None,
+                lifetime: ReadWriteGrantLifetimeRequest::Duration { seconds: 60 },
+                tree: false,
+            }),
+        }) {
+            Response::Warning { message } => {
+                assert!(message.contains("requester identity unavailable"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let data = log::read_log(&session.runtime.sandbox_log_path("a")).unwrap();
+        assert!(data.contains("decision request=1 ALLOW downgraded=grantless"));
+        assert!(data.contains("requester identity unavailable"));
+        assert_waiter_decision(&waiter, PendingDecision::Apply);
+        let registry = session.registry.lock().unwrap();
+        assert!(registry.pending_read_write.is_empty());
+        assert!(registry.read_write_grants.is_empty());
+    }
+
+    #[test]
+    fn read_write_one_shot_grant_releases_earliest_matching_pending_request_only() {
+        let (_temp, session, _writer, first_waiter) =
+            session_with_pending_read_write_request_and_writer();
+        let second_waiter: crate::state::PendingWaiter =
+            Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+        {
+            let mut registry = session.registry.lock().unwrap();
+            let identity = SysinfoProcessInfoProvider
+                .identity_for_pid(std::process::id())
+                .unwrap();
+            registry
+                .pending_read_write
+                .get_mut(&1)
+                .unwrap()
+                .process_identity = Some(identity);
+            registry.insert_pending_read_write_request(
+                crate::state::PendingReadWriteRequest::new(
+                    2,
+                    "a".to_string(),
+                    crate::state::ReadWriteOperation::ReadFile {
+                        path: SandboxPath::new("/data/file").unwrap(),
+                    },
+                    std::process::id(),
+                    1000,
+                    1000,
+                )
+                .with_process_identity(Some(identity)),
+            );
+            registry
+                .pending_waiters
+                .insert(2, Arc::clone(&second_waiter));
+            registry.next_operation_id = 3;
+        }
+
+        match session.handle(Request::Allow {
+            name: "a".to_string(),
+            id: 2,
+            do_nothing: false,
+            grant: Some(ReadWriteGrantOptions {
+                path: None,
+                lifetime: ReadWriteGrantLifetimeRequest::OneShot,
+                tree: false,
+            }),
+        }) {
+            Response::Ok => {}
+            other => panic!("unexpected {other:?}"),
+        }
+
+        assert_waiter_decision(&first_waiter, PendingDecision::Apply);
+        assert_eq!(*second_waiter.0.lock().unwrap(), None);
+        let registry = session.registry.lock().unwrap();
+        assert!(!registry.pending_read_write.contains_key(&1));
+        assert!(registry.pending_read_write.contains_key(&2));
+        assert!(registry.read_write_grants.is_empty());
+    }
+
+    #[test]
+    fn read_write_duration_grant_releases_all_matching_pending_requests_and_persists() {
+        let (_temp, session, _writer, first_waiter) =
+            session_with_pending_read_write_request_and_writer();
+        let second_waiter: crate::state::PendingWaiter =
+            Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+        {
+            let mut registry = session.registry.lock().unwrap();
+            let identity = SysinfoProcessInfoProvider
+                .identity_for_pid(std::process::id())
+                .unwrap();
+            registry
+                .pending_read_write
+                .get_mut(&1)
+                .unwrap()
+                .process_identity = Some(identity);
+            registry.insert_pending_read_write_request(
+                crate::state::PendingReadWriteRequest::new(
+                    2,
+                    "a".to_string(),
+                    crate::state::ReadWriteOperation::ReadFile {
+                        path: SandboxPath::new("/data/other").unwrap(),
+                    },
+                    std::process::id(),
+                    1000,
+                    1000,
+                )
+                .with_process_identity(Some(identity)),
+            );
+            registry
+                .pending_waiters
+                .insert(2, Arc::clone(&second_waiter));
+            registry.next_operation_id = 3;
+        }
+
+        match session.handle(Request::Allow {
+            name: "a".to_string(),
+            id: 1,
+            do_nothing: false,
+            grant: Some(ReadWriteGrantOptions {
+                path: Some(SandboxPath::new("/data/**").unwrap()),
+                lifetime: ReadWriteGrantLifetimeRequest::Duration { seconds: 60 },
+                tree: false,
+            }),
+        }) {
+            Response::Ok => {}
+            other => panic!("unexpected {other:?}"),
+        }
+
+        assert_waiter_decision(&first_waiter, PendingDecision::Apply);
+        assert_waiter_decision(&second_waiter, PendingDecision::Apply);
+        let registry = session.registry.lock().unwrap();
+        assert!(registry.pending_read_write.is_empty());
+        assert_eq!(registry.read_write_grants.len(), 1);
+        assert!(matches!(
+            registry.read_write_grants.values().next().unwrap().lifetime,
+            ReadWriteGrantLifetime::Duration { .. }
+        ));
     }
 
     #[test]
@@ -1422,6 +2031,7 @@ mod tests {
             name: "a".to_string(),
             id: 1,
             do_nothing: false,
+            grant: None,
         }) {
             Response::Ok => {}
             other => panic!("unexpected {other:?}"),
@@ -1562,6 +2172,7 @@ mod tests {
             name: "a".to_string(),
             id: 2,
             do_nothing: false,
+            grant: None,
         }) {
             Response::Ok => {}
             other => panic!("unexpected {other:?}"),
@@ -1621,6 +2232,7 @@ mod tests {
             name: "a".to_string(),
             id: 2,
             do_nothing: true,
+            grant: None,
         }) {
             Response::Ok => {}
             other => panic!("unexpected {other:?}"),
@@ -1705,16 +2317,22 @@ mod tests {
         {
             let mut registry = session.registry.lock().unwrap();
             registry.next_operation_id = 2;
-            registry.insert_pending_read_write_request(crate::state::PendingReadWriteRequest::new(
-                1,
-                "a".to_string(),
-                crate::state::ReadWriteOperation::ReadFile {
-                    path: SandboxPath::new("/data/file").unwrap(),
-                },
-                123,
-                1000,
-                1000,
-            ));
+            let process_identity = SysinfoProcessInfoProvider
+                .identity_for_pid(std::process::id())
+                .unwrap();
+            registry.insert_pending_read_write_request(
+                crate::state::PendingReadWriteRequest::new(
+                    1,
+                    "a".to_string(),
+                    crate::state::ReadWriteOperation::ReadFile {
+                        path: SandboxPath::new("/data/file").unwrap(),
+                    },
+                    std::process::id(),
+                    1000,
+                    1000,
+                )
+                .with_process_identity(Some(process_identity)),
+            );
             registry.pending_waiters.insert(1, Arc::clone(&waiter));
         }
         (temp, session, writer, waiter)

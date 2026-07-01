@@ -48,10 +48,16 @@ sandboxfs <name> mount <local> <on_fs>
 sandboxfs <name> mount
 sandboxfs <name> umount <on_fs>
 sandboxfs <name> hide <on_fs>
+sandboxfs <name> protect-read <pattern>
+sandboxfs <name> protect-write <pattern>
+sandboxfs <name> unprotect-read <pattern>
+sandboxfs <name> unprotect-write <pattern>
+sandboxfs <name> list-protection [--read] [--write]
 sandboxfs <name> chmod ...
 sandboxfs <name> chown ...
 sandboxfs <name> chattr ...
 sandboxfs <name> allow [operation_id]
+sandboxfs <name> allow <operation_id> [--path <sandbox-glob>] [--duration[=<duration>]] [--tree]
 sandboxfs <name> allow --do-nothing <operation_id>
 sandboxfs <name> deny <operation_id>
 sandboxfs <name> cancel <operation_id>
@@ -109,7 +115,9 @@ Inspecting pending requests is read-only. Multiple CLI tools or Access TUI insta
 
 `allow --do-nothing` lets the blocked FUSE request return success without changing sandbox metadata or underlying files.
 
-The TUI displays pending requests and supports allow, deny, do-nothing, and edit-command. Edit-command reruns a user-edited `chmod`, `chown`, or `chattr` through the trusted `sandboxfs` CLI path, then releases the original pending request with do-nothing.
+Read/write protection rules are configured separately with `protect-read`, `protect-write`, `unprotect-read`, `unprotect-write`, and `list-protection`. For protected read/write requests, bare `allow <operation_id>` only releases the current blocked request. Add grant options to create a future-matching read/write grant: `--path <sandbox-glob>` chooses the grant path pattern, `--duration` or `--duration=<duration>` creates a duration grant (default 30 minutes), and `--tree` snapshots the requester's current process tree instead of the exact requester process. If grant options are present without `--duration`, the grant is one-shot.
+
+The TUI displays pending requests and supports allow, deny, do-nothing, and edit-command. Edit-command reruns a user-edited `chmod`, `chown`, or `chattr` through the trusted `sandboxfs` CLI path, then releases the original pending request with do-nothing. Read/write TUI allow/deny/do-nothing resolves only the selected pending request and does not create broader grants.
 
 ## Logs and monitoring
 
