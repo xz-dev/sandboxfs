@@ -14,7 +14,7 @@ use crate::ipc::{self, Request, Response};
 use crate::path::{SandboxPath, rewrite_sandbox_path_arg};
 use crate::runtime::RuntimePaths;
 use crate::session;
-use crate::state::TrustedPathScope;
+use crate::state::{ProtectionKind, ProtectionRule, TrustedPathScope};
 use crate::{Error, Result};
 
 #[derive(Debug, Parser)]
@@ -62,6 +62,24 @@ enum SandboxCommand {
     },
     Hide {
         on_fs: String,
+    },
+    ProtectRead {
+        pattern: String,
+    },
+    ProtectWrite {
+        pattern: String,
+    },
+    UnprotectRead {
+        pattern: String,
+    },
+    UnprotectWrite {
+        pattern: String,
+    },
+    ListProtection {
+        #[arg(long, action = ArgAction::SetTrue)]
+        read: bool,
+        #[arg(long, action = ArgAction::SetTrue)]
+        write: bool,
     },
     Chmod {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -179,6 +197,39 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
                 on_fs: SandboxPath::new(on_fs)?,
             },
         )?),
+        SandboxCommand::ProtectRead { pattern } => protect(
+            runtime,
+            &name,
+            ProtectionKind::Read,
+            SandboxPath::new(pattern)?,
+        ),
+        SandboxCommand::ProtectWrite { pattern } => protect(
+            runtime,
+            &name,
+            ProtectionKind::Write,
+            SandboxPath::new(pattern)?,
+        ),
+        SandboxCommand::UnprotectRead { pattern } => unprotect(
+            runtime,
+            &name,
+            ProtectionKind::Read,
+            SandboxPath::new(pattern)?,
+        ),
+        SandboxCommand::UnprotectWrite { pattern } => unprotect(
+            runtime,
+            &name,
+            ProtectionKind::Write,
+            SandboxPath::new(pattern)?,
+        ),
+        SandboxCommand::ListProtection { read, write } => print_response(send(
+            runtime,
+            &name,
+            &Request::ListProtection {
+                name: name.clone(),
+                include_read: read,
+                include_write: write,
+            },
+        )?),
         SandboxCommand::Chmod { args } => run_trusted_command(runtime, &name, "chmod", args),
         SandboxCommand::Chown { args } => run_trusted_command(runtime, &name, "chown", args),
         SandboxCommand::Chattr { args } => run_trusted_command(runtime, &name, "chattr", args),
@@ -223,6 +274,40 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
     }
 }
 
+fn protect(
+    runtime: &RuntimePaths,
+    name: &str,
+    kind: ProtectionKind,
+    pattern: SandboxPath,
+) -> Result<i32> {
+    print_response(send(
+        runtime,
+        name,
+        &Request::Protect {
+            name: name.to_string(),
+            kind,
+            pattern,
+        },
+    )?)
+}
+
+fn unprotect(
+    runtime: &RuntimePaths,
+    name: &str,
+    kind: ProtectionKind,
+    pattern: SandboxPath,
+) -> Result<i32> {
+    print_response(send(
+        runtime,
+        name,
+        &Request::Unprotect {
+            name: name.to_string(),
+            kind,
+            pattern,
+        },
+    )?)
+}
+
 fn send(runtime: &RuntimePaths, name: &str, request: &Request) -> Result<Response> {
     ipc::send(&runtime.socket_path(name), request).map_err(|error| {
         Error::msg(format!(
@@ -247,6 +332,13 @@ fn print_response(response: Response) -> Result<i32> {
             }
             Ok(0)
         }
+        Response::ProtectionRules { items } => {
+            let text = format_protection_rules(&items);
+            if !text.is_empty() {
+                println!("{text}");
+            }
+            Ok(0)
+        }
         Response::Trusted { .. } => Ok(0),
         Response::Error { message } => Err(Error::msg(message)),
     }
@@ -256,6 +348,14 @@ fn format_pending_items(items: &[crate::state::PendingMetadataRequest]) -> Strin
     items
         .iter()
         .map(|item| format!("{} {}", item.id, item.description))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_protection_rules(items: &[ProtectionRule]) -> String {
+    items
+        .iter()
+        .map(|item| format!("{} {}", item.kind, item.pattern))
         .collect::<Vec<_>>()
         .join("\n")
 }

@@ -18,7 +18,8 @@ use crate::log;
 use crate::path::SandboxPath;
 use crate::runtime::RuntimePaths;
 use crate::state::{
-    AttachMount, PendingDecision, Sandbox, SandboxRegistry, TrustedOperation, TrustedPathScope,
+    AttachMount, PendingDecision, ProtectionKind, Sandbox, SandboxRegistry, TrustedOperation,
+    TrustedPathScope,
 };
 use crate::{Error, Result};
 
@@ -101,6 +102,21 @@ impl SessionState {
             }
             Request::Umount { name, on_fs } => self.umount_layer(&name, &on_fs),
             Request::Hide { name, on_fs } => self.hide(&name, on_fs),
+            Request::Protect {
+                name,
+                kind,
+                pattern,
+            } => self.protect(&name, kind, pattern),
+            Request::Unprotect {
+                name,
+                kind,
+                pattern,
+            } => self.unprotect(&name, kind, pattern),
+            Request::ListProtection {
+                name,
+                include_read,
+                include_write,
+            } => self.list_protection(&name, include_read, include_write),
             Request::ListMounts { name } => self.list_mounts(&name),
             Request::Metadata { name } => self.metadata(&name),
             Request::BeginTrustedOperation {
@@ -307,6 +323,69 @@ impl SessionState {
             log::format_log_line(id, &format!("hide path={on_fs}")),
         )?;
         Ok(Response::Ok)
+    }
+
+    fn protect(&self, name: &str, kind: ProtectionKind, pattern: SandboxPath) -> Result<Response> {
+        let mut registry = self.registry.lock().unwrap();
+        let id = registry.next_operation_id();
+        let sandbox = registry
+            .sandboxes
+            .get_mut(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        let result = sandbox.protect(kind, pattern.clone());
+        self.log_writer.append(
+            &sandbox.log_path,
+            log::format_log_line(
+                id,
+                &format!(
+                    "protect kind={kind} pattern={pattern} result={}",
+                    result.log_name()
+                ),
+            ),
+        )?;
+        Ok(Response::Ok)
+    }
+
+    fn unprotect(
+        &self,
+        name: &str,
+        kind: ProtectionKind,
+        pattern: SandboxPath,
+    ) -> Result<Response> {
+        let mut registry = self.registry.lock().unwrap();
+        let id = registry.next_operation_id();
+        let sandbox = registry
+            .sandboxes
+            .get_mut(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        let result = sandbox.unprotect(kind, &pattern);
+        self.log_writer.append(
+            &sandbox.log_path,
+            log::format_log_line(
+                id,
+                &format!(
+                    "unprotect kind={kind} pattern={pattern} result={}",
+                    result.log_name()
+                ),
+            ),
+        )?;
+        Ok(Response::Ok)
+    }
+
+    fn list_protection(
+        &self,
+        name: &str,
+        include_read: bool,
+        include_write: bool,
+    ) -> Result<Response> {
+        let registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        Ok(Response::ProtectionRules {
+            items: sandbox.protection_rules(include_read, include_write),
+        })
     }
 
     fn list_mounts(&self, name: &str) -> Result<Response> {

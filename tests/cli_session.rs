@@ -81,6 +81,77 @@ fn mount_hide_umount_monitor_and_destroy_use_isolated_runtime() {
 }
 
 #[test]
+fn protection_rule_commands_log_outcomes_and_list_sorted_filters_without_logging() {
+    let session = RunningSession::start("demo_cli_protection");
+
+    session
+        .sandbox_cmd()
+        .args(["protect-write", "/b"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["protect-read", "/a"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["protect-write", "/a"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["protect-read", "/a"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["unprotect-read", "/missing"])
+        .assert()
+        .success();
+
+    session
+        .sandbox_cmd()
+        .arg("list-protection")
+        .assert()
+        .success()
+        .stdout("READ /a\nWRITE /a\nWRITE /b\n");
+    session
+        .sandbox_cmd()
+        .args(["list-protection", "--read"])
+        .assert()
+        .success()
+        .stdout("READ /a\n");
+    session
+        .sandbox_cmd()
+        .args(["list-protection", "--write"])
+        .assert()
+        .success()
+        .stdout("WRITE /a\nWRITE /b\n");
+    session
+        .sandbox_cmd()
+        .args(["list-protection", "--read", "--write"])
+        .assert()
+        .success()
+        .stdout("READ /a\nWRITE /a\nWRITE /b\n");
+
+    let log_path = session.log_dir().join(format!("{}.log", session.name));
+    let log_before_list = fs::read_to_string(&log_path).unwrap();
+    session
+        .sandbox_cmd()
+        .arg("list-protection")
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(&log_path).unwrap(), log_before_list);
+
+    assert!(log_before_list.contains("protect kind=WRITE pattern=/b result=added"));
+    assert!(log_before_list.contains("protect kind=READ pattern=/a result=added"));
+    assert!(log_before_list.contains("protect kind=WRITE pattern=/a result=added"));
+    assert!(log_before_list.contains("protect kind=READ pattern=/a result=already-present"));
+    assert!(log_before_list.contains("unprotect kind=READ pattern=/missing result=not-present"));
+}
+
+#[test]
 fn trusted_metadata_command_failure_preserves_underlying_metadata() {
     let session = RunningSession::start("demo_cli_trusted_failure");
     let local = session.temp.path().join("local");

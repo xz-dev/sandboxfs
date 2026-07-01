@@ -1,7 +1,7 @@
 //! In-memory sandbox data model and overlay resolution.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -28,6 +28,59 @@ pub struct MountLayer {
 pub struct HideRule {
     pub id: u64,
     pub path: SandboxPath,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtectionKind {
+    Read,
+    Write,
+}
+
+impl ProtectionKind {
+    pub fn log_name(self) -> &'static str {
+        match self {
+            Self::Read => "READ",
+            Self::Write => "WRITE",
+        }
+    }
+}
+
+impl std::fmt::Display for ProtectionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.log_name())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtectionRule {
+    pub kind: ProtectionKind,
+    pub pattern: SandboxPath,
+}
+
+impl ProtectionRule {
+    pub fn matches(&self, path: &SandboxPath) -> bool {
+        protected_pattern_matches(&self.pattern, path)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectionRuleResult {
+    Added,
+    AlreadyPresent,
+    Removed,
+    NotPresent,
+}
+
+impl ProtectionRuleResult {
+    pub fn log_name(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::AlreadyPresent => "already-present",
+            Self::Removed => "removed",
+            Self::NotPresent => "not-present",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -300,6 +353,7 @@ pub struct Sandbox {
     pub layers: Vec<MountLayer>,
     pub hides: Vec<HideRule>,
     pub metadata: BTreeMap<SandboxPath, MetadataOverride>,
+    pub protection_rules: Vec<ProtectionRule>,
     pub attaches: BTreeMap<PathBuf, AttachMount>,
     pub next_layer_id: u64,
     pub next_hide_id: u64,
@@ -313,6 +367,7 @@ impl Sandbox {
             layers: Vec::new(),
             hides: Vec::new(),
             metadata: BTreeMap::new(),
+            protection_rules: Vec::new(),
             attaches: BTreeMap::new(),
             next_layer_id: 1,
             next_hide_id: 1,
@@ -350,6 +405,61 @@ impl Sandbox {
         let id = self.next_overlay_order();
         self.hides.push(HideRule { id, path });
         id
+    }
+
+    pub fn protect(&mut self, kind: ProtectionKind, pattern: SandboxPath) -> ProtectionRuleResult {
+        if self
+            .protection_rules
+            .iter()
+            .any(|rule| rule.kind == kind && rule.pattern == pattern)
+        {
+            return ProtectionRuleResult::AlreadyPresent;
+        }
+        self.protection_rules.push(ProtectionRule { kind, pattern });
+        ProtectionRuleResult::Added
+    }
+
+    pub fn unprotect(
+        &mut self,
+        kind: ProtectionKind,
+        pattern: &SandboxPath,
+    ) -> ProtectionRuleResult {
+        let Some(index) = self
+            .protection_rules
+            .iter()
+            .position(|rule| rule.kind == kind && &rule.pattern == pattern)
+        else {
+            return ProtectionRuleResult::NotPresent;
+        };
+        self.protection_rules.remove(index);
+        ProtectionRuleResult::Removed
+    }
+
+    pub fn protection_rules(&self, include_read: bool, include_write: bool) -> Vec<ProtectionRule> {
+        let include_all = !include_read && !include_write;
+        let include_read = include_read || include_all;
+        let include_write = include_write || include_all;
+        let mut rules: Vec<ProtectionRule> = self
+            .protection_rules
+            .iter()
+            .filter(|rule| match rule.kind {
+                ProtectionKind::Read => include_read,
+                ProtectionKind::Write => include_write,
+            })
+            .cloned()
+            .collect();
+        rules.sort_by(|left, right| {
+            left.pattern
+                .cmp(&right.pattern)
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        rules
+    }
+
+    pub fn is_protected(&self, kind: ProtectionKind, path: &SandboxPath) -> bool {
+        self.protection_rules
+            .iter()
+            .any(|rule| rule.kind == kind && rule.matches(path))
     }
 
     pub fn is_hidden(&self, path: &SandboxPath) -> bool {
@@ -568,6 +678,77 @@ pub fn stable_ino(path: &SandboxPath) -> INodeNo {
     INodeNo(FIRST_DYNAMIC_INO + (hash & 0x000f_ffff_ffff_ffff))
 }
 
+fn protected_pattern_matches(pattern: &SandboxPath, path: &SandboxPath) -> bool {
+    let pattern_components = sandbox_path_components(pattern);
+    let path_components = sandbox_path_components(path);
+    if matches_pattern_components(&pattern_components, &path_components) {
+        return true;
+    }
+    if matches!(
+        pattern_components.last().map(String::as_str),
+        Some("*") | Some("**")
+    ) && pattern_components[..pattern_components.len() - 1] == path_components[..]
+    {
+        return true;
+    }
+    false
+}
+
+fn sandbox_path_components(path: &SandboxPath) -> Vec<String> {
+    path.as_path()
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn matches_pattern_components(pattern: &[String], path: &[String]) -> bool {
+    match pattern.split_first() {
+        None => path.is_empty(),
+        Some((head, rest)) if head == "**" => {
+            (0..=path.len()).any(|skip| matches_pattern_components(rest, &path[skip..]))
+        }
+        Some((head, rest)) => {
+            if let Some((path_head, path_rest)) = path.split_first() {
+                component_pattern_matches(head, path_head)
+                    && matches_pattern_components(rest, path_rest)
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn component_pattern_matches(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+    let mut remainder = value;
+    let mut parts = pattern.split('*').peekable();
+    let first = parts.next().unwrap_or_default();
+    if !first.is_empty() {
+        let Some(stripped) = remainder.strip_prefix(first) else {
+            return false;
+        };
+        remainder = stripped;
+    }
+    while let Some(part) = parts.next() {
+        if part.is_empty() {
+            continue;
+        }
+        if parts.peek().is_none() {
+            return remainder.ends_with(part);
+        }
+        let Some(index) = remainder.find(part) else {
+            return false;
+        };
+        remainder = &remainder[index + part.len()..];
+    }
+    true
+}
+
 pub fn mode_to_kind(mode: u32, metadata_file_type: std::fs::FileType) -> FileType {
     if metadata_file_type.is_dir() {
         FileType::Directory
@@ -703,5 +884,114 @@ mod tests {
             s.metadata_differences(),
             vec![SandboxPath::new("/a").unwrap()]
         );
+    }
+
+    #[test]
+    fn protection_pattern_matching_uses_exact_single_component_and_recursive_globs() {
+        let mut s = Sandbox::new("s", TempDir::new().unwrap().path().join("s.log"));
+        s.protect(ProtectionKind::Read, SandboxPath::new("/secret").unwrap());
+        s.protect(
+            ProtectionKind::Write,
+            SandboxPath::new("/direct/*").unwrap(),
+        );
+        s.protect(ProtectionKind::Read, SandboxPath::new("/tree/**").unwrap());
+        s.protect(
+            ProtectionKind::Read,
+            SandboxPath::new("/glob/*.txt").unwrap(),
+        );
+
+        assert!(s.is_protected(ProtectionKind::Read, &SandboxPath::new("/secret").unwrap()));
+        assert!(!s.is_protected(
+            ProtectionKind::Read,
+            &SandboxPath::new("/secret/file").unwrap()
+        ));
+        assert!(s.is_protected(ProtectionKind::Write, &SandboxPath::new("/direct").unwrap()));
+        assert!(s.is_protected(
+            ProtectionKind::Write,
+            &SandboxPath::new("/direct/file").unwrap()
+        ));
+        assert!(!s.is_protected(
+            ProtectionKind::Write,
+            &SandboxPath::new("/direct/a/b").unwrap()
+        ));
+        assert!(s.is_protected(ProtectionKind::Read, &SandboxPath::new("/tree").unwrap()));
+        assert!(s.is_protected(
+            ProtectionKind::Read,
+            &SandboxPath::new("/tree/a/b").unwrap()
+        ));
+        assert!(s.is_protected(
+            ProtectionKind::Read,
+            &SandboxPath::new("/glob/a.txt").unwrap()
+        ));
+        assert!(!s.is_protected(
+            ProtectionKind::Read,
+            &SandboxPath::new("/glob/a.md").unwrap()
+        ));
+    }
+
+    #[test]
+    fn protection_rules_are_idempotent_and_removed_by_exact_kind_and_pattern() {
+        let mut s = Sandbox::new("s", TempDir::new().unwrap().path().join("s.log"));
+        let pattern = SandboxPath::new("/secret/**").unwrap();
+
+        assert_eq!(
+            s.protect(ProtectionKind::Read, pattern.clone()),
+            ProtectionRuleResult::Added
+        );
+        assert_eq!(
+            s.protect(ProtectionKind::Read, pattern.clone()),
+            ProtectionRuleResult::AlreadyPresent
+        );
+        assert_eq!(
+            s.protect(ProtectionKind::Write, pattern.clone()),
+            ProtectionRuleResult::Added
+        );
+        assert_eq!(s.protection_rules.len(), 2);
+        assert_eq!(
+            s.unprotect(
+                ProtectionKind::Read,
+                &SandboxPath::new("/secret/*").unwrap()
+            ),
+            ProtectionRuleResult::NotPresent
+        );
+        assert_eq!(
+            s.unprotect(ProtectionKind::Read, &pattern),
+            ProtectionRuleResult::Removed
+        );
+        assert_eq!(
+            s.unprotect(ProtectionKind::Read, &pattern),
+            ProtectionRuleResult::NotPresent
+        );
+        assert_eq!(s.protection_rules.len(), 1);
+        assert!(s.is_protected(
+            ProtectionKind::Write,
+            &SandboxPath::new("/secret/file").unwrap()
+        ));
+    }
+
+    #[test]
+    fn protection_list_is_filtered_and_sorted_for_display() {
+        let mut s = Sandbox::new("s", TempDir::new().unwrap().path().join("s.log"));
+        s.protect(ProtectionKind::Write, SandboxPath::new("/b").unwrap());
+        s.protect(ProtectionKind::Write, SandboxPath::new("/a").unwrap());
+        s.protect(ProtectionKind::Read, SandboxPath::new("/b").unwrap());
+        s.protect(ProtectionKind::Read, SandboxPath::new("/a").unwrap());
+
+        let all = s.protection_rules(false, false);
+        assert_eq!(
+            all.iter()
+                .map(|rule| (rule.kind, rule.pattern.to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ProtectionKind::Read, "/a".to_string()),
+                (ProtectionKind::Write, "/a".to_string()),
+                (ProtectionKind::Read, "/b".to_string()),
+                (ProtectionKind::Write, "/b".to_string()),
+            ]
+        );
+
+        assert_eq!(s.protection_rules(true, false).len(), 2);
+        assert_eq!(s.protection_rules(false, true).len(), 2);
+        assert_eq!(s.protection_rules(true, true), all);
     }
 }
