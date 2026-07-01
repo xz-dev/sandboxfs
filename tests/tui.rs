@@ -6,7 +6,10 @@ use predicates::prelude::*;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use sandboxfs::path::SandboxPath;
-use sandboxfs::state::{MetadataOperation, PendingMetadataRequest};
+use sandboxfs::state::{
+    MetadataOperation, PendingMetadataRequest, PendingReadWriteRequest, PendingRequest,
+    ReadWriteOperation,
+};
 use sandboxfs::tui::PendingAction;
 use tempfile::TempDir;
 
@@ -27,7 +30,7 @@ fn buffer_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
 
 #[test]
 fn tui_renders_pending_request_and_controls() {
-    let pending = vec![PendingMetadataRequest {
+    let pending = vec![PendingRequest::Metadata(PendingMetadataRequest {
         id: 42,
         sandbox: "demo_tui".to_string(),
         operation: MetadataOperation::Chmod {
@@ -39,7 +42,7 @@ fn tui_renders_pending_request_and_controls() {
         uid: 1000,
         gid: 1000,
         description: "path=/data/file SETATTR mode=0444".to_string(),
-    }];
+    })];
     let backend = TestBackend::new(80, 12);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
@@ -52,6 +55,33 @@ fn tui_renders_pending_request_and_controls() {
     assert!(lines[3].contains("path=/data/file SETATTR mode=0444"));
     let rendered = lines.join("\n");
     assert!(rendered.contains("a=allow d=deny n=do-nothing e=edit q=quit ok"));
+}
+
+#[test]
+fn tui_renders_read_write_request_without_edit_control() {
+    let pending = vec![PendingRequest::ReadWrite(PendingReadWriteRequest::new(
+        43,
+        "demo_tui".to_string(),
+        ReadWriteOperation::ReadFile {
+            path: SandboxPath::new("/secret/file").unwrap(),
+        },
+        321,
+        1001,
+        1002,
+    ))];
+    let backend = TestBackend::new(100, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| sandboxfs::tui::draw_pending(frame, &pending, 0, "ok"))
+        .unwrap();
+    let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+    assert!(rendered.contains("id=43"));
+    assert!(rendered.contains("kind=READ"));
+    assert!(rendered.contains("path=/secret/file"));
+    assert!(rendered.contains("pid=321 uid=1001 gid=1002"));
+    assert!(rendered.contains("path=/secret/file READ file"));
+    assert!(rendered.contains("a=allow d=deny n=do-nothing q=quit ok"));
+    assert!(!rendered.contains("e=edit"));
 }
 
 #[test]

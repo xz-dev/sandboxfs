@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::ipc::{self, Request, Response};
 use crate::runtime::RuntimePaths;
-use crate::state::{PendingMetadataRequest, PendingRequest};
+use crate::state::PendingRequest;
 use crate::{Error, Result};
 
 pub fn run(name: String) -> Result<i32> {
@@ -47,20 +47,14 @@ where
     let mut selected = 0usize;
     let mut message = String::new();
     loop {
-        let pending: Vec<PendingMetadataRequest> = match send(
+        let pending = match send(
             runtime,
             name,
             &Request::Pending {
                 name: name.to_string(),
             },
         )? {
-            Response::Pending { items } => items
-                .into_iter()
-                .filter_map(|item| match item {
-                    PendingRequest::Metadata(request) => Some(request),
-                    PendingRequest::ReadWrite(_) => None,
-                })
-                .collect(),
+            Response::Pending { items } => items,
             Response::Error { message } => return Err(Error::msg(message)),
             other => {
                 return Err(Error::msg(format!(
@@ -88,23 +82,31 @@ where
                 KeyCode::Char('a') => {
                     if let Some(p) = pending.get(selected) {
                         message =
-                            resolve_pending_action(runtime, name, p.id, PendingAction::Allow)?;
+                            resolve_pending_action(runtime, name, p.id(), PendingAction::Allow)?;
                     }
                 }
                 KeyCode::Char('n') => {
                     if let Some(p) = pending.get(selected) {
-                        message =
-                            resolve_pending_action(runtime, name, p.id, PendingAction::DoNothing)?;
+                        message = resolve_pending_action(
+                            runtime,
+                            name,
+                            p.id(),
+                            PendingAction::DoNothing,
+                        )?;
                     }
                 }
                 KeyCode::Char('d') => {
                     if let Some(p) = pending.get(selected) {
-                        message = resolve_pending_action(runtime, name, p.id, PendingAction::Deny)?;
+                        message =
+                            resolve_pending_action(runtime, name, p.id(), PendingAction::Deny)?;
                     }
                 }
                 KeyCode::Char('e') => {
                     if let Some(p) = pending.get(selected) {
-                        message = edit_pending_command(name, p.id, &p.operation.shell_hint())?;
+                        message = match p.metadata_shell_hint() {
+                            Some(command) => edit_pending_command(name, p.id(), &command)?,
+                            None => "edit is only available for metadata requests".to_string(),
+                        };
                     }
                 }
                 _ => {}
@@ -147,7 +149,7 @@ pub fn resolve_pending_action(
 
 pub fn draw_pending(
     frame: &mut ratatui::Frame<'_>,
-    pending: &[PendingMetadataRequest],
+    pending: &[PendingRequest],
     selected: usize,
     message: &str,
 ) {
@@ -172,7 +174,7 @@ pub fn draw_pending(
         .iter()
         .enumerate()
         .map(|(idx, p)| {
-            let line = Line::from(format!("id={} {}", p.id, p.description));
+            let line = Line::from(format_pending_row(p));
             let item = ListItem::new(line);
             if idx == selected {
                 item.style(Style::default().add_modifier(Modifier::REVERSED))
@@ -185,22 +187,53 @@ pub fn draw_pending(
         List::new(items).block(Block::default().title("Pending").borders(Borders::ALL)),
         chunks[1],
     );
+    let controls = match pending.get(selected) {
+        Some(PendingRequest::Metadata(_)) => "a=allow d=deny n=do-nothing e=edit q=quit",
+        Some(PendingRequest::ReadWrite(_)) => "a=allow d=deny n=do-nothing q=quit",
+        None => "q=quit",
+    };
     frame.render_widget(
-        Paragraph::new(format!(
-            "a=allow d=deny n=do-nothing e=edit q=quit {message}"
-        ))
-        .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(format!("{controls} {message}"))
+            .block(Block::default().borders(Borders::ALL)),
         chunks[2],
     );
 }
 
-fn format_selected_pending(pending: &PendingMetadataRequest) -> String {
-    format!(
-        "id={}\npath={}\n{}",
-        pending.id,
-        pending.operation.path(),
-        pending.description
-    )
+fn format_pending_row(pending: &PendingRequest) -> String {
+    match pending {
+        PendingRequest::Metadata(request) => format!("id={} {}", request.id, request.description),
+        PendingRequest::ReadWrite(request) => format!(
+            "id={} {} path={} {} pid={} uid={} gid={}",
+            request.id,
+            request.kind,
+            request.path,
+            request.description,
+            request.pid,
+            request.uid,
+            request.gid
+        ),
+    }
+}
+
+fn format_selected_pending(pending: &PendingRequest) -> String {
+    match pending {
+        PendingRequest::Metadata(request) => format!(
+            "id={}\npath={}\n{}",
+            request.id,
+            request.operation.path(),
+            request.description
+        ),
+        PendingRequest::ReadWrite(request) => format!(
+            "id={}\nkind={}\npath={}\npid={} uid={} gid={}\n{}",
+            request.id,
+            request.kind,
+            request.path,
+            request.pid,
+            request.uid,
+            request.gid,
+            request.description
+        ),
+    }
 }
 
 pub fn edit_pending_command(name: &str, id: u64, current_command: &str) -> Result<String> {
