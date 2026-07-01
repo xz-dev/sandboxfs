@@ -18,8 +18,8 @@ use crate::log;
 use crate::path::SandboxPath;
 use crate::runtime::RuntimePaths;
 use crate::state::{
-    AttachMount, PendingDecision, ProtectionKind, Sandbox, SandboxRegistry, TrustedOperation,
-    TrustedPathScope,
+    AttachMount, PendingDecision, PendingRequest, ProtectionKind, Sandbox, SandboxRegistry,
+    TrustedOperation, TrustedPathScope,
 };
 use crate::{Error, Result};
 
@@ -148,13 +148,13 @@ impl SessionState {
             };
             let mountpoints: Vec<PathBuf> = sandbox.attaches.keys().cloned().collect();
             let removed_pending: Vec<u64> = registry
-                .pending
-                .iter()
-                .filter_map(|(id, pending)| (pending.sandbox == name).then_some(*id))
+                .pending_requests_for_sandbox(name)
+                .into_iter()
+                .map(|pending| pending.id())
                 .collect();
             let mut waiters = Vec::new();
             for id in removed_pending {
-                registry.remove_pending_request(id);
+                registry.remove_any_pending_request(id);
                 if let Some(waiter) = registry.pending_waiters.remove(&id) {
                     waiters.push(waiter);
                 }
@@ -487,22 +487,17 @@ impl SessionState {
         if !registry.sandboxes.contains_key(name) {
             return Err(Error::msg(format!("sandbox not found: {name}")));
         }
-        let items = registry
-            .pending
-            .values()
-            .filter(|p| p.sandbox == name)
-            .cloned()
-            .collect();
+        let items = registry.pending_requests_for_sandbox(name);
         Ok(Response::Pending { items })
     }
 
     fn allow(&self, name: &str, id: u64, do_nothing: bool) -> Result<Response> {
         let mut registry = self.registry.lock().unwrap();
         let pending = registry
-            .remove_pending_request(id)
+            .remove_any_pending_request(id)
             .ok_or_else(|| Error::msg(format!("pending operation not found: {id}")))?;
-        if pending.sandbox != name {
-            registry.insert_pending_request(pending);
+        if pending.sandbox() != name {
+            registry.insert_any_pending_request(pending);
             return Err(Error::msg(format!(
                 "pending operation {id} does not belong to sandbox {name}"
             )));
@@ -515,7 +510,10 @@ impl SessionState {
             .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?
             .log_path
             .clone();
-        if waiter.is_none() && !do_nothing {
+        if waiter.is_none()
+            && !do_nothing
+            && let PendingRequest::Metadata(pending) = &pending
+        {
             let sandbox = registry
                 .sandboxes
                 .get_mut(name)
@@ -551,10 +549,10 @@ impl SessionState {
     fn deny(&self, name: &str, id: u64) -> Result<Response> {
         let mut registry = self.registry.lock().unwrap();
         let pending = registry
-            .remove_pending_request(id)
+            .remove_any_pending_request(id)
             .ok_or_else(|| Error::msg(format!("pending operation not found: {id}")))?;
-        if pending.sandbox != name {
-            registry.insert_pending_request(pending);
+        if pending.sandbox() != name {
+            registry.insert_any_pending_request(pending);
             return Err(Error::msg(format!(
                 "pending operation {id} does not belong to sandbox {name}"
             )));
@@ -852,6 +850,109 @@ mod tests {
     }
 
     #[test]
+    fn pending_lists_metadata_and_read_write_requests_sorted_by_id() {
+        let (_temp, session, writer, _waiter) = session_with_pending_request_and_writer();
+        {
+            let mut registry = session.registry.lock().unwrap();
+            registry.insert_pending_read_write_request(crate::state::PendingReadWriteRequest::new(
+                3,
+                "a".to_string(),
+                crate::state::ReadWriteOperation::ReadFile {
+                    path: SandboxPath::new("/data/file").unwrap(),
+                },
+                123,
+                1000,
+                1000,
+            ));
+        }
+
+        match session.handle(Request::Pending {
+            name: "a".to_string(),
+        }) {
+            Response::Pending { items } => {
+                assert_eq!(
+                    items
+                        .iter()
+                        .map(crate::state::PendingRequest::id)
+                        .collect::<Vec<_>>(),
+                    vec![1, 3]
+                );
+                assert!(matches!(
+                    items[0],
+                    crate::state::PendingRequest::Metadata(_)
+                ));
+                assert!(matches!(
+                    items[1],
+                    crate::state::PendingRequest::ReadWrite(_)
+                ));
+                assert_eq!(items[1].description(), "path=/data/file READ file");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn allow_logs_and_notifies_read_write_request() {
+        let (_temp, session, _writer, waiter) =
+            session_with_pending_read_write_request_and_writer();
+
+        match session.handle(Request::Allow {
+            name: "a".to_string(),
+            id: 1,
+            do_nothing: false,
+        }) {
+            Response::Ok => {}
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let data = log::read_log(&session.runtime.sandbox_log_path("a")).unwrap();
+        assert!(data.contains(" id=2 decision request=1 ALLOW"));
+        assert_waiter_decision(&waiter, PendingDecision::Apply);
+        assert_no_pending_read_write_request(&session);
+    }
+
+    #[test]
+    fn allow_do_nothing_logs_and_notifies_read_write_request() {
+        let (_temp, session, _writer, waiter) =
+            session_with_pending_read_write_request_and_writer();
+
+        match session.handle(Request::Allow {
+            name: "a".to_string(),
+            id: 1,
+            do_nothing: true,
+        }) {
+            Response::Ok => {}
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let data = log::read_log(&session.runtime.sandbox_log_path("a")).unwrap();
+        assert!(data.contains(" id=2 decision request=1 ALLOW_DO_NOTHING"));
+        assert_waiter_decision(&waiter, PendingDecision::DoNothing);
+        assert_no_pending_read_write_request(&session);
+    }
+
+    #[test]
+    fn deny_logs_and_notifies_read_write_request() {
+        let (_temp, session, _writer, waiter) =
+            session_with_pending_read_write_request_and_writer();
+
+        match session.handle(Request::Deny {
+            name: "a".to_string(),
+            id: 1,
+        }) {
+            Response::Ok => {}
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let data = log::read_log(&session.runtime.sandbox_log_path("a")).unwrap();
+        assert!(data.contains(" id=2 decision request=1 DENY"));
+        assert_waiter_decision(&waiter, PendingDecision::Deny);
+        assert_no_pending_read_write_request(&session);
+    }
+
+    #[test]
     fn concurrent_pending_views_do_not_consume_request() {
         let (_temp, session, writer, waiter) = session_with_pending_request_and_writer();
         let session = Arc::new(session);
@@ -864,8 +965,8 @@ mod tests {
                 }) {
                     Response::Pending { items } => {
                         assert_eq!(items.len(), 1);
-                        assert_eq!(items[0].id, 1);
-                        assert_eq!(items[0].description, "path=/data/file SETATTR mode=0444");
+                        assert_eq!(items[0].id(), 1);
+                        assert_eq!(items[0].description(), "path=/data/file SETATTR mode=0444");
                     }
                     other => panic!("unexpected {other:?}"),
                 }
@@ -1128,6 +1229,39 @@ mod tests {
         (temp, session, writer, waiter)
     }
 
+    fn session_with_pending_read_write_request_and_writer() -> (
+        TempDir,
+        SessionState,
+        log::LogWriter,
+        crate::state::PendingWaiter,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let runtime = RuntimePaths::for_tests(temp.path().to_path_buf(), None);
+        let writer = log::LogWriter::new();
+        let writer_handle = writer.handle();
+        let session = SessionState::with_log_writer(runtime, writer_handle, None);
+        session.create_initial("a").unwrap();
+
+        let waiter: crate::state::PendingWaiter =
+            Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+        {
+            let mut registry = session.registry.lock().unwrap();
+            registry.next_operation_id = 2;
+            registry.insert_pending_read_write_request(crate::state::PendingReadWriteRequest::new(
+                1,
+                "a".to_string(),
+                crate::state::ReadWriteOperation::ReadFile {
+                    path: SandboxPath::new("/data/file").unwrap(),
+                },
+                123,
+                1000,
+                1000,
+            ));
+            registry.pending_waiters.insert(1, Arc::clone(&waiter));
+        }
+        (temp, session, writer, waiter)
+    }
+
     fn assert_waiter_decision(waiter: &crate::state::PendingWaiter, decision: PendingDecision) {
         let (lock, _cvar) = &**waiter;
         assert_eq!(*lock.lock().unwrap(), Some(decision));
@@ -1136,6 +1270,12 @@ mod tests {
     fn assert_no_pending_request(session: &SessionState) {
         let registry = session.registry.lock().unwrap();
         assert!(!registry.pending.contains_key(&1));
+        assert!(!registry.pending_waiters.contains_key(&1));
+    }
+
+    fn assert_no_pending_read_write_request(session: &SessionState) {
+        let registry = session.registry.lock().unwrap();
+        assert!(!registry.pending_read_write.contains_key(&1));
         assert!(!registry.pending_waiters.contains_key(&1));
     }
 }

@@ -83,6 +83,71 @@ impl ProtectionRuleResult {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum ReadWriteOperation {
+    ReadFile { path: SandboxPath },
+    ReadDirectory { path: SandboxPath },
+    OpenWrite { path: SandboxPath },
+    WriteFile { path: SandboxPath },
+    Truncate { path: SandboxPath },
+    Create { path: SandboxPath },
+    Mkdir { path: SandboxPath },
+    Unlink { path: SandboxPath },
+    Rmdir { path: SandboxPath },
+    Rename { from: SandboxPath, to: SandboxPath },
+}
+
+impl ReadWriteOperation {
+    pub fn kind(&self) -> ProtectionKind {
+        match self {
+            Self::ReadFile { .. } | Self::ReadDirectory { .. } => ProtectionKind::Read,
+            Self::OpenWrite { .. }
+            | Self::WriteFile { .. }
+            | Self::Truncate { .. }
+            | Self::Create { .. }
+            | Self::Mkdir { .. }
+            | Self::Unlink { .. }
+            | Self::Rmdir { .. }
+            | Self::Rename { .. } => ProtectionKind::Write,
+        }
+    }
+
+    pub fn path(&self) -> &SandboxPath {
+        match self {
+            Self::ReadFile { path }
+            | Self::ReadDirectory { path }
+            | Self::OpenWrite { path }
+            | Self::WriteFile { path }
+            | Self::Truncate { path }
+            | Self::Create { path }
+            | Self::Mkdir { path }
+            | Self::Unlink { path }
+            | Self::Rmdir { path } => path,
+            Self::Rename { from, .. } => from,
+        }
+    }
+
+    pub fn description(&self) -> String {
+        self.event_body()
+    }
+
+    pub fn event_body(&self) -> String {
+        match self {
+            Self::ReadFile { path } => format!("path={path} READ file"),
+            Self::ReadDirectory { path } => format!("path={path} READ directory"),
+            Self::OpenWrite { path } => format!("path={path} WRITE open"),
+            Self::WriteFile { path } => format!("path={path} WRITE data"),
+            Self::Truncate { path } => format!("path={path} WRITE truncate"),
+            Self::Create { path } => format!("path={path} WRITE create"),
+            Self::Mkdir { path } => format!("path={path} WRITE mkdir"),
+            Self::Unlink { path } => format!("path={path} WRITE unlink"),
+            Self::Rmdir { path } => format!("path={path} WRITE rmdir"),
+            Self::Rename { from, to } => format!("path={from} WRITE rename to={to}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetadataOverride {
     pub mode: Option<u16>,
@@ -297,6 +362,86 @@ impl PendingMetadataRequest {
                 kind,
             })
             .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingReadWriteRequest {
+    pub id: u64,
+    pub sandbox: String,
+    pub operation: ReadWriteOperation,
+    pub kind: ProtectionKind,
+    pub path: SandboxPath,
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub description: String,
+}
+
+impl PendingReadWriteRequest {
+    pub fn new(
+        id: u64,
+        sandbox: String,
+        operation: ReadWriteOperation,
+        pid: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Self {
+        Self {
+            id,
+            sandbox,
+            kind: operation.kind(),
+            path: operation.path().clone(),
+            description: operation.description(),
+            operation,
+            pid,
+            uid,
+            gid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "pending_kind", rename_all = "snake_case")]
+pub enum PendingRequest {
+    Metadata(PendingMetadataRequest),
+    ReadWrite(PendingReadWriteRequest),
+}
+
+impl PendingRequest {
+    pub fn id(&self) -> u64 {
+        match self {
+            Self::Metadata(request) => request.id,
+            Self::ReadWrite(request) => request.id,
+        }
+    }
+
+    pub fn sandbox(&self) -> &str {
+        match self {
+            Self::Metadata(request) => &request.sandbox,
+            Self::ReadWrite(request) => &request.sandbox,
+        }
+    }
+
+    pub fn path(&self) -> &SandboxPath {
+        match self {
+            Self::Metadata(request) => request.operation.path(),
+            Self::ReadWrite(request) => &request.path,
+        }
+    }
+
+    pub fn description(&self) -> &str {
+        match self {
+            Self::Metadata(request) => &request.description,
+            Self::ReadWrite(request) => &request.description,
+        }
+    }
+
+    pub fn metadata_shell_hint(&self) -> Option<String> {
+        match self {
+            Self::Metadata(request) => Some(request.operation.shell_hint()),
+            Self::ReadWrite(_) => None,
+        }
     }
 }
 
@@ -614,6 +759,7 @@ impl Sandbox {
 pub struct SandboxRegistry {
     pub sandboxes: HashMap<String, Sandbox>,
     pub pending: BTreeMap<u64, PendingMetadataRequest>,
+    pub pending_read_write: BTreeMap<u64, PendingReadWriteRequest>,
     pub pending_waiters: HashMap<u64, PendingWaiter>,
     pub pending_index: BTreeMap<PendingOperationKey, u64>,
     pub trusted: HashMap<String, TrustedOperation>,
@@ -648,6 +794,10 @@ impl SandboxRegistry {
         self.pending.insert(request.id, request);
     }
 
+    pub fn insert_pending_read_write_request(&mut self, request: PendingReadWriteRequest) {
+        self.pending_read_write.insert(request.id, request);
+    }
+
     pub fn remove_pending_request(&mut self, id: u64) -> Option<PendingMetadataRequest> {
         let request = self.pending.remove(&id)?;
         for key in request.keys() {
@@ -656,6 +806,46 @@ impl SandboxRegistry {
             }
         }
         Some(request)
+    }
+
+    pub fn remove_pending_read_write_request(
+        &mut self,
+        id: u64,
+    ) -> Option<PendingReadWriteRequest> {
+        self.pending_read_write.remove(&id)
+    }
+
+    pub fn remove_any_pending_request(&mut self, id: u64) -> Option<PendingRequest> {
+        if let Some(request) = self.remove_pending_request(id) {
+            return Some(PendingRequest::Metadata(request));
+        }
+        self.remove_pending_read_write_request(id)
+            .map(PendingRequest::ReadWrite)
+    }
+
+    pub fn insert_any_pending_request(&mut self, request: PendingRequest) {
+        match request {
+            PendingRequest::Metadata(request) => self.insert_pending_request(request),
+            PendingRequest::ReadWrite(request) => self.insert_pending_read_write_request(request),
+        }
+    }
+
+    pub fn pending_requests_for_sandbox(&self, name: &str) -> Vec<PendingRequest> {
+        let metadata = self
+            .pending
+            .values()
+            .filter(|request| request.sandbox == name)
+            .cloned()
+            .map(PendingRequest::Metadata);
+        let read_write = self
+            .pending_read_write
+            .values()
+            .filter(|request| request.sandbox == name)
+            .cloned()
+            .map(PendingRequest::ReadWrite);
+        let mut items: Vec<_> = metadata.chain(read_write).collect();
+        items.sort_by_key(PendingRequest::id);
+        items
     }
 }
 
@@ -993,5 +1183,71 @@ mod tests {
         assert_eq!(s.protection_rules(true, false).len(), 2);
         assert_eq!(s.protection_rules(false, true).len(), 2);
         assert_eq!(s.protection_rules(true, true), all);
+    }
+
+    #[test]
+    fn read_write_operations_describe_kind_and_primary_path() {
+        let read = ReadWriteOperation::ReadDirectory {
+            path: SandboxPath::new("/data").unwrap(),
+        };
+        assert_eq!(read.kind(), ProtectionKind::Read);
+        assert_eq!(read.path(), &SandboxPath::new("/data").unwrap());
+        assert_eq!(read.event_body(), "path=/data READ directory");
+
+        let rename = ReadWriteOperation::Rename {
+            from: SandboxPath::new("/data/old").unwrap(),
+            to: SandboxPath::new("/data/new").unwrap(),
+        };
+        assert_eq!(rename.kind(), ProtectionKind::Write);
+        assert_eq!(rename.path(), &SandboxPath::new("/data/old").unwrap());
+        assert_eq!(
+            rename.event_body(),
+            "path=/data/old WRITE rename to=/data/new"
+        );
+    }
+
+    #[test]
+    fn registry_tracks_read_write_pending_separately_and_lists_sorted() {
+        let mut registry = SandboxRegistry::new();
+        let metadata_operation = MetadataOperation::Chmod {
+            path: SandboxPath::new("/data/file").unwrap(),
+            mode: 0o444,
+        };
+        registry.insert_pending_request(PendingMetadataRequest {
+            id: 2,
+            sandbox: "s".to_string(),
+            operation: metadata_operation.clone(),
+            kinds: metadata_operation.pending_kinds(),
+            pid: 123,
+            uid: 1000,
+            gid: 1000,
+            description: metadata_operation.description(),
+        });
+        registry.insert_pending_read_write_request(PendingReadWriteRequest::new(
+            1,
+            "s".to_string(),
+            ReadWriteOperation::ReadFile {
+                path: SandboxPath::new("/data/file").unwrap(),
+            },
+            123,
+            1000,
+            1000,
+        ));
+
+        let items = registry.pending_requests_for_sandbox("s");
+        assert_eq!(
+            items.iter().map(PendingRequest::id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(items[0].description(), "path=/data/file READ file");
+        assert_eq!(items[1].description(), "path=/data/file SETATTR mode=0444");
+
+        assert!(matches!(
+            registry.remove_any_pending_request(1),
+            Some(PendingRequest::ReadWrite(_))
+        ));
+        assert!(registry.pending_read_write.is_empty());
+        assert!(registry.pending.contains_key(&2));
+        assert_eq!(registry.pending_index.len(), 1);
     }
 }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::path::SandboxPath;
-use crate::state::{PendingMetadataRequest, ProtectionKind, ProtectionRule, TrustedPathScope};
+use crate::state::{PendingRequest, ProtectionKind, ProtectionRule, TrustedPathScope};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -99,7 +99,7 @@ pub enum Response {
         text: String,
     },
     Pending {
-        items: Vec<PendingMetadataRequest>,
+        items: Vec<PendingRequest>,
     },
     ProtectionRules {
         items: Vec<ProtectionRule>,

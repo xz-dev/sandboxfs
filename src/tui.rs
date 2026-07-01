@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::ipc::{self, Request, Response};
 use crate::runtime::RuntimePaths;
+use crate::state::{PendingMetadataRequest, PendingRequest};
 use crate::{Error, Result};
 
 pub fn run(name: String) -> Result<i32> {
@@ -46,14 +47,20 @@ where
     let mut selected = 0usize;
     let mut message = String::new();
     loop {
-        let pending = match send(
+        let pending: Vec<PendingMetadataRequest> = match send(
             runtime,
             name,
             &Request::Pending {
                 name: name.to_string(),
             },
         )? {
-            Response::Pending { items } => items,
+            Response::Pending { items } => items
+                .into_iter()
+                .filter_map(|item| match item {
+                    PendingRequest::Metadata(request) => Some(request),
+                    PendingRequest::ReadWrite(_) => None,
+                })
+                .collect(),
             Response::Error { message } => return Err(Error::msg(message)),
             other => {
                 return Err(Error::msg(format!(
@@ -140,7 +147,7 @@ pub fn resolve_pending_action(
 
 pub fn draw_pending(
     frame: &mut ratatui::Frame<'_>,
-    pending: &[crate::state::PendingMetadataRequest],
+    pending: &[PendingMetadataRequest],
     selected: usize,
     message: &str,
 ) {
@@ -187,7 +194,7 @@ pub fn draw_pending(
     );
 }
 
-fn format_selected_pending(pending: &crate::state::PendingMetadataRequest) -> String {
+fn format_selected_pending(pending: &PendingMetadataRequest) -> String {
     format!(
         "id={}\npath={}\n{}",
         pending.id,

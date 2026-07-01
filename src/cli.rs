@@ -14,7 +14,7 @@ use crate::ipc::{self, Request, Response};
 use crate::path::{SandboxPath, rewrite_sandbox_path_arg};
 use crate::runtime::RuntimePaths;
 use crate::session;
-use crate::state::{ProtectionKind, ProtectionRule, TrustedPathScope};
+use crate::state::{PendingRequest, ProtectionKind, ProtectionRule, TrustedPathScope};
 use crate::{Error, Result};
 
 #[derive(Debug, Parser)]
@@ -344,10 +344,10 @@ fn print_response(response: Response) -> Result<i32> {
     }
 }
 
-fn format_pending_items(items: &[crate::state::PendingMetadataRequest]) -> String {
+fn format_pending_items(items: &[PendingRequest]) -> String {
     items
         .iter()
-        .map(|item| format!("{} {}", item.id, item.description))
+        .map(|item| format!("{} {}", item.id(), item.description()))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -826,7 +826,7 @@ mod tests {
     #[test]
     fn pending_response_lines_use_operation_descriptions() {
         let items = vec![
-            crate::state::PendingMetadataRequest {
+            PendingRequest::Metadata(crate::state::PendingMetadataRequest {
                 id: 7,
                 sandbox: "demo".to_string(),
                 operation: crate::state::MetadataOperation::Chmod {
@@ -838,8 +838,8 @@ mod tests {
                 uid: 1000,
                 gid: 1000,
                 description: "path=/data/file SETATTR mode=0444".to_string(),
-            },
-            crate::state::PendingMetadataRequest {
+            }),
+            PendingRequest::Metadata(crate::state::PendingMetadataRequest {
                 id: 8,
                 sandbox: "demo".to_string(),
                 operation: crate::state::MetadataOperation::Chattr {
@@ -851,7 +851,7 @@ mod tests {
                 uid: 1000,
                 gid: 1000,
                 description: "path=/data/file CHATTR flags=0x10".to_string(),
-            },
+            }),
         ];
 
         assert_eq!(
