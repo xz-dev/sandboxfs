@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod fs;
+pub mod hostfs;
 pub mod ipc;
 pub mod log;
 pub mod path;

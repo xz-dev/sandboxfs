@@ -15,6 +15,7 @@ use fuser::{
     ReplyEntry, ReplyIoctl, ReplyOpen, ReplyWrite, Request,
 };
 
+use crate::hostfs;
 use crate::log;
 use crate::path::SandboxPath;
 use crate::process_info::{ProcessInfoProvider, SysinfoProcessInfoProvider};
@@ -606,7 +607,7 @@ impl Filesystem for SandboxFs {
             return;
         };
         match sandbox.resolve(&path) {
-            Some(ResolvedPath::Real { local_path, .. }) => match std::fs::read_link(local_path) {
+            Some(ResolvedPath::Real { local_path, .. }) => match hostfs::read_link(&local_path) {
                 Ok(target) => reply.data(target.as_os_str().as_bytes()),
                 Err(err) => reply.error(io_to_errno(err)),
             },
