@@ -197,6 +197,116 @@ fn attach_readlink_passthrough() {
 
 #[test]
 #[ignore]
+fn attach_reports_backing_statfs() {
+    require_fuse();
+    if !fuse_enabled() {
+        return;
+    }
+    let session = RunningSession::start("demo_fuse_statfs");
+    let local = session.temp.path().join("local");
+    let mountpoint = session.temp.path().join("mnt");
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&mountpoint).unwrap();
+
+    session
+        .sandbox_cmd()
+        .args(["mount", local.to_str().unwrap(), "/data"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["attach", mountpoint.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let path = std::ffi::CString::new(mountpoint.join("data").to_str().unwrap()).unwrap();
+    let result = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
+    assert_eq!(result, 0);
+    let stat = unsafe { stat.assume_init() };
+    assert!(stat.f_bsize > 0);
+    assert!(stat.f_namemax > 0);
+}
+
+#[test]
+#[ignore]
+fn access_uses_sandbox_visible_mode() {
+    require_fuse();
+    if !fuse_enabled() {
+        return;
+    }
+    let session = RunningSession::start("demo_fuse_access");
+    let local = session.temp.path().join("local");
+    let mountpoint = session.temp.path().join("mnt");
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&mountpoint).unwrap();
+    fs::write(local.join("script"), "#!/bin/sh\n").unwrap();
+
+    session
+        .sandbox_cmd()
+        .args(["mount", local.to_str().unwrap(), "/data"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["attach", mountpoint.to_str().unwrap()])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["chmod", "644", "/data/script"])
+        .assert()
+        .success();
+
+    let path = std::ffi::CString::new(mountpoint.join("data/script").to_str().unwrap()).unwrap();
+    let result = unsafe { libc::access(path.as_ptr(), libc::X_OK) };
+    assert_eq!(result, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EACCES)
+    );
+
+    session
+        .sandbox_cmd()
+        .args(["chmod", "755", "/data/script"])
+        .assert()
+        .success();
+    let result = unsafe { libc::access(path.as_ptr(), libc::X_OK) };
+    assert_eq!(result, 0);
+}
+
+#[test]
+#[ignore]
+fn fsync_read_handle_succeeds() {
+    require_fuse();
+    if !fuse_enabled() {
+        return;
+    }
+    let session = RunningSession::start("demo_fuse_fsync");
+    let local = session.temp.path().join("local");
+    let mountpoint = session.temp.path().join("mnt");
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&mountpoint).unwrap();
+    fs::write(local.join("file"), "hello").unwrap();
+
+    session
+        .sandbox_cmd()
+        .args(["mount", local.to_str().unwrap(), "/data"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["attach", mountpoint.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let file = fs::File::open(mountpoint.join("data/file")).unwrap();
+    file.sync_all().unwrap();
+    file.sync_data().unwrap();
+}
+
+#[test]
+#[ignore]
 fn attach_read_and_read_only_write_error() {
     require_fuse();
     if !fuse_enabled() {

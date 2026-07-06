@@ -10,9 +10,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::SystemTime;
 
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    OpenAccMode, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyIoctl, ReplyOpen, ReplyWrite, Request,
+    AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, OpenAccMode, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyIoctl, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
 };
 
 use crate::hostfs;
@@ -616,6 +616,52 @@ impl Filesystem for SandboxFs {
         }
     }
 
+    fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
+        let path = self.path_for_ino(ino).unwrap_or_else(SandboxPath::root);
+        let registry = self.registry.lock().unwrap();
+        let Some(sandbox) = registry.sandboxes.get(&self.sandbox_name) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let local_path = match sandbox.resolve(&path) {
+            Some(ResolvedPath::Real { local_path, .. }) => local_path,
+            Some(ResolvedPath::VirtualDir { .. }) => sandbox
+                .layers
+                .last()
+                .map(|layer| layer.local.clone())
+                .unwrap_or_else(|| PathBuf::from("/")),
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+        match hostfs::statfs(&local_path) {
+            Ok(stat) => reply.statfs(
+                stat.blocks,
+                stat.bfree,
+                stat.bavail,
+                stat.files,
+                stat.ffree,
+                stat.bsize,
+                stat.namelen,
+                stat.frsize,
+            ),
+            Err(err) => reply.error(io_to_errno(err)),
+        }
+    }
+
+    fn access(&self, req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        let Some(path) = self.path_for_ino(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match self.attr_for_path(&path) {
+            Ok(attr) if check_access(&attr, req.uid(), req.gid(), mask) => reply.ok(),
+            Ok(_) => reply.error(Errno::EACCES),
+            Err(err) => reply.error(err),
+        }
+    }
+
     fn readdir(
         &self,
         req: &Request,
@@ -780,6 +826,21 @@ impl Filesystem for SandboxFs {
         }
     }
 
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: fuser::LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        if self.handles.lock().unwrap().contains_key(&fh.0) {
+            reply.ok();
+        } else {
+            reply.error(Errno::EBADF);
+        }
+    }
+
     fn release(
         &self,
         _req: &Request,
@@ -792,6 +853,21 @@ impl Filesystem for SandboxFs {
     ) {
         self.handles.lock().unwrap().remove(&fh.0);
         reply.ok();
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        if self.handles.lock().unwrap().contains_key(&fh.0) {
+            reply.ok();
+        } else {
+            reply.error(Errno::EBADF);
+        }
     }
 
     fn setattr(
@@ -1060,6 +1136,38 @@ fn format_attach_field(attach_id: Option<u64>) -> String {
     attach_id
         .map(|id| format!(" attach={id}"))
         .unwrap_or_default()
+}
+
+fn check_access(attr: &FileAttr, uid: u32, gid: u32, mask: AccessFlags) -> bool {
+    if mask.is_empty() {
+        return true;
+    }
+    let perm = u32::from(attr.perm);
+    let shift = if uid == 0 {
+        6
+    } else if uid == attr.uid {
+        6
+    } else if gid == attr.gid {
+        3
+    } else {
+        0
+    };
+    if mask.contains(AccessFlags::R_OK) && ((perm >> shift) & 0o4 == 0) {
+        return false;
+    }
+    if mask.contains(AccessFlags::W_OK) && ((perm >> shift) & 0o2 == 0) {
+        return false;
+    }
+    if mask.contains(AccessFlags::X_OK)
+        && (if uid == 0 {
+            perm & 0o111 == 0
+        } else {
+            (perm >> shift) & 0o1 == 0
+        })
+    {
+        return false;
+    }
+    true
 }
 
 fn wait_for_decision(waiter: &PendingWaiter) -> PendingDecision {
