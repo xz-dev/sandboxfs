@@ -3,10 +3,11 @@ set -euo pipefail
 
 # Minimal demo wrapper: run pi inside a bubblewrap root backed by sandboxfs.
 #
-# The sandboxfs view starts from host /, hides /home and $HOME, then re-exposes
-# only the current working directory and $HOME/.pi. The wrapped process inherits
-# the caller's environment; this script only replaces PATH with a small system
-# PATH so hidden home PATH entries are not accidentally re-exposed.
+# sandboxfs is used here to make the agent's filesystem view and operations
+# observable, not to provide a strong isolation boundary. The view starts from
+# host / and only hides /home by default. The wrapped process inherits the
+# caller's environment; this script only replaces PATH with a small system PATH
+# so hidden home PATH entries are not accidentally re-exposed.
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 HOST_CWD=$(pwd -P)
@@ -51,34 +52,6 @@ resolve_pi() {
     fi
 }
 
-clean_abs_path() {
-    local path=$1
-    if [[ $path != /* ]]; then
-        path=$HOST_CWD/$path
-    fi
-    while [[ $path == *///* ]]; do
-        path=${path//\/\//\/}
-    done
-    if [[ $path != / ]]; then
-        path=${path%/}
-    fi
-    printf '%s\n' "$path"
-}
-
-canonical_dir() {
-    local path=$1
-    (cd -- "$path" && pwd -P)
-}
-
-protect_tree_pattern() {
-    local path=$1
-    if [[ $path == / ]]; then
-        printf '/**\n'
-    else
-        printf '%s/**\n' "$path"
-    fi
-}
-
 BWRAP_BIN=${BWRAP_BIN:-bwrap}
 require_executable "$BWRAP_BIN"
 SANDBOXFS_BIN=$(resolve_sandboxfs)
@@ -88,11 +61,10 @@ TMP_ROOT=$(mktemp -d -p /tmp pi-sandbox.XXXXXXXXXX)
 RUNTIME_DIR=$TMP_ROOT/run
 LOG_DIR=$TMP_ROOT/logs
 ATTACH_DIR=$TMP_ROOT/root
-SCAFFOLD_ROOT=$TMP_ROOT/scaffold
 SESSION_NAME=pi-sandbox-$$
 SESSION_PID=
 
-mkdir -p -- "$RUNTIME_DIR" "$LOG_DIR" "$ATTACH_DIR" "$SCAFFOLD_ROOT"
+mkdir -p -- "$RUNTIME_DIR" "$LOG_DIR" "$ATTACH_DIR"
 
 sf() {
     SANDBOXFS_RUNTIME_DIR=$RUNTIME_DIR \
@@ -143,83 +115,20 @@ if [[ ! -S $SOCKET ]]; then
     exit 1
 fi
 
-declare -A SCAFFOLD_MOUNTS=()
-
-add_scaffold_mount() {
-    local sandbox_path=$1
-    [[ -n ${SCAFFOLD_MOUNTS[$sandbox_path]+set} ]] && return 0
-    local local_path=$SCAFFOLD_ROOT${sandbox_path}
-    mkdir -p -- "$local_path"
-    sf mount "$local_path" "$sandbox_path"
-    SCAFFOLD_MOUNTS[$sandbox_path]=1
-}
-
-ensure_hidden_path_ancestors() {
-    local target=$1
-    local needs_scaffold=0
-    local accum=
-    local -a parts=()
-
-    case "$target" in
-        /home|/home/*) needs_scaffold=1 ;;
-    esac
-    if [[ $target == "$HOST_HOME" || $target == "$HOST_HOME"/* ]]; then
-        needs_scaffold=1
-    fi
-    [[ $needs_scaffold == 1 ]] || return 0
-
-    IFS=/ read -r -a parts <<< "${target#/}"
-    for ((i = 0; i + 1 < ${#parts[@]}; i++)); do
-        [[ -z ${parts[$i]} ]] && continue
-        accum=$accum/${parts[$i]}
-        add_scaffold_mount "$accum"
-    done
-}
-
-add_write_protected_tree() {
-    local local_path=$1
-    local sandbox_path=$2
-    sandbox_path=$(clean_abs_path "$sandbox_path")
-
-    if [[ ! -d $local_path ]]; then
-        printf 'pi-sandbox: warning: skipping missing directory: %s\n' "$local_path" >&2
-        return 0
-    fi
-
-    ensure_hidden_path_ancestors "$sandbox_path"
-    sf mount "$local_path" "$sandbox_path"
-    sf protect-write "$(protect_tree_pattern "$sandbox_path")"
-}
-
-# Base view: root redirect, then hide home details until explicitly re-added.
+# Base view: root redirect for observability, with only /home hidden by default.
 sf mount / /
 sf hide /home
-sf hide "$HOST_HOME"
 
-add_write_protected_tree "$HOST_CWD" "$HOST_CWD"
-
+# If the caller's pi config lives under hidden /home, re-expose only that config
+# directory so pi can run while other /home details remain hidden.
 PI_HOME_DIR=$HOST_HOME/.pi
-if [[ -d $PI_HOME_DIR ]]; then
-    add_write_protected_tree "$(canonical_dir "$PI_HOME_DIR")" "$PI_HOME_DIR"
-else
+if [[ $PI_HOME_DIR == /home/* && -d $PI_HOME_DIR ]]; then
+    sf mount "$PI_HOME_DIR" "$PI_HOME_DIR"
+elif [[ $PI_HOME_DIR == /home/* ]]; then
     printf 'pi-sandbox: warning: %s does not exist; pi config may be unavailable\n' "$PI_HOME_DIR" >&2
 fi
 
 sf attach "$ATTACH_DIR"
-
-BWRAP_CWD_ARGS=()
-case "$HOST_CWD" in
-    /tmp|/tmp/*|/run|/run/*)
-        accum=
-        IFS=/ read -r -a parts <<< "${HOST_CWD#/}"
-        for part in "${parts[@]}"; do
-            [[ -z $part ]] && continue
-            accum=$accum/$part
-            BWRAP_CWD_ARGS+=(--dir "$accum")
-        done
-        BWRAP_CWD_ARGS+=(--bind "$ATTACH_DIR$HOST_CWD" "$HOST_CWD")
-        ;;
-esac
 
 cat >&2 <<EOF
 pi-sandbox: sandboxfs session is running
@@ -228,7 +137,7 @@ pi-sandbox: sandboxfs session is running
   logs:    $LOG_DIR
   mount:   $ATTACH_DIR
 
-If pi blocks on a protected write, resolve it from another terminal with:
+Inspect the sandboxfs session from another terminal with:
   SANDBOXFS_RUNTIME_DIR=$RUNTIME_DIR SANDBOXFS_LOG_DIR=$LOG_DIR sandboxfs-access-tui $SESSION_NAME
 
 Set PI_SANDBOX_KEEP=1 to keep the temporary directory after exit.
@@ -239,9 +148,6 @@ EOF
     --bind "$ATTACH_DIR" / \
     --dev /dev \
     --proc /proc \
-    --tmpfs /tmp \
-    --tmpfs /run \
-    "${BWRAP_CWD_ARGS[@]}" \
     --chdir "$HOST_CWD" \
     --setenv PATH "$SANDBOXED_PATH" \
     "$PI_BIN" "$@"
