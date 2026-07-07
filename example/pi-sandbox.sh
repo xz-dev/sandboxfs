@@ -5,10 +5,10 @@ set -euo pipefail
 #
 # sandboxfs is used here to make the agent's filesystem view and operations
 # observable, not to provide a strong isolation boundary. The view starts from
-# host /, hides /home and $HOME, then re-exposes $HOME/.pi and the current
-# working directory. The wrapped process inherits the caller's environment; this
-# script only replaces PATH with a small system PATH so hidden home PATH entries
-# are not accidentally re-exposed.
+# host /, hides /home and $HOME, then re-exposes $HOME/.pi, $HOME/.agents,
+# and the current working directory. The wrapped process inherits the caller's
+# environment; this script only replaces PATH with a small system PATH so hidden
+# home PATH entries are not accidentally re-exposed.
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 HOST_CWD=$(pwd -P)
@@ -122,6 +122,7 @@ sf mount / /
 sf hide /home
 sf hide "$HOST_HOME"
 sf mount "$HOST_HOME/.pi" "$HOST_HOME/.pi"
+sf mount "$HOST_HOME/.agents" "$HOST_HOME/.agents"
 sf mount "$HOST_CWD" "$HOST_CWD"
 
 sf attach "$ATTACH_DIR"
