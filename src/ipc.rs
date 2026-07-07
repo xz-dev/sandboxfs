@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 use crate::path::SandboxPath;
 use crate::state::{
-    PendingRequest, ProtectionKind, ProtectionRule, ReadWriteGrantOptions, TrustedPathScope,
+    PassthroughRule, PendingRequest, PolicyPattern, ProtectionKind, ProtectionRule,
+    ReadWriteGrantOptions, TrustedPathScope,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,17 +45,34 @@ pub enum Request {
     Protect {
         name: String,
         kind: ProtectionKind,
-        pattern: SandboxPath,
+        pattern: PolicyPattern,
     },
     Unprotect {
         name: String,
         kind: ProtectionKind,
-        pattern: SandboxPath,
+        pattern: PolicyPattern,
+    },
+    Passthrough {
+        name: String,
+        kind: ProtectionKind,
+        pattern: PolicyPattern,
+    },
+    Unpassthrough {
+        name: String,
+        kind: ProtectionKind,
+        pattern: PolicyPattern,
     },
     ListProtection {
         name: String,
         include_read: bool,
         include_write: bool,
+        include_metadata: bool,
+    },
+    ListPassthrough {
+        name: String,
+        include_read: bool,
+        include_write: bool,
+        include_metadata: bool,
     },
     ListMounts {
         name: String,
@@ -118,6 +136,9 @@ pub enum Response {
     },
     ProtectionRules {
         items: Vec<ProtectionRule>,
+    },
+    PassthroughRules {
+        items: Vec<PassthroughRule>,
     },
     Trusted {
         token: String,

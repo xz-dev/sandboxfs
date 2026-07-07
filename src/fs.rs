@@ -21,9 +21,9 @@ use crate::path::SandboxPath;
 use crate::process_info::{ProcessInfoProvider, SysinfoProcessInfoProvider};
 use crate::state::{
     FS_IMMUTABLE_FL, GrantMatchOutcome, MetadataObjectKey, MetadataOperation, PendingDecision,
-    PendingMetadataRequest, PendingReadWriteRequest, PendingWaiter, ReadWriteOperation,
-    RequesterIdentity as RequestIdentity, ResolvedPath, SandboxRegistry, TTL, apply_override,
-    mode_to_kind, pending_metadata_keys, stable_ino, virtual_dir_attr,
+    PendingMetadataRequest, PendingReadWriteRequest, PendingWaiter, ProtectionKind,
+    ReadWriteOperation, RequesterIdentity as RequestIdentity, ResolvedPath, SandboxRegistry, TTL,
+    apply_override, mode_to_kind, pending_metadata_keys, stable_ino, virtual_dir_attr,
 };
 
 const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
@@ -181,6 +181,47 @@ impl SandboxFs {
         parent_path.join(Path::new(name)).map_err(|_| Errno::EINVAL)
     }
 
+    fn local_path_for_child(
+        &self,
+        parent: INodeNo,
+        name: &OsStr,
+    ) -> std::result::Result<PathBuf, Errno> {
+        let parent_path = self.path_for_ino(parent).ok_or(Errno::ENOENT)?;
+        let registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get(&self.sandbox_name)
+            .ok_or(Errno::ENOENT)?;
+        match sandbox.resolve(&parent_path) {
+            Some(ResolvedPath::Real { local_path, .. }) => Ok(local_path.join(Path::new(name))),
+            Some(ResolvedPath::VirtualDir { .. }) => Err(Errno::EROFS),
+            None => Err(Errno::ENOENT),
+        }
+    }
+
+    fn path_is_directory(&self, path: &SandboxPath) -> std::result::Result<bool, Errno> {
+        let registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get(&self.sandbox_name)
+            .ok_or(Errno::ENOENT)?;
+        Ok(sandbox.path_is_directory(path))
+    }
+
+    fn path_matches_passthrough(
+        &self,
+        kind: ProtectionKind,
+        path: &SandboxPath,
+        target_is_dir: bool,
+    ) -> std::result::Result<bool, Errno> {
+        let registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get(&self.sandbox_name)
+            .ok_or(Errno::ENOENT)?;
+        Ok(sandbox.is_passthrough(kind, path, target_is_dir))
+    }
+
     fn is_trusted_operation(
         registry: &SandboxRegistry,
         sandbox_name: &str,
@@ -289,11 +330,22 @@ impl SandboxFs {
         if kinds.is_empty() {
             return Ok(MetadataOutcome::Applied(unchanged_attr));
         }
-        let log_path = registry
-            .sandboxes
-            .get(&self.sandbox_name)
-            .map(|s| s.log_path.clone())
-            .ok_or(Errno::ENOENT)?;
+        let Some(sandbox) = registry.sandboxes.get(&self.sandbox_name) else {
+            return Err(Errno::ENOENT);
+        };
+        let target_is_dir = sandbox.path_is_directory(&path);
+        if !sandbox.is_protected(ProtectionKind::Metadata, &path, target_is_dir) {
+            let sandbox = registry
+                .sandboxes
+                .get_mut(&self.sandbox_name)
+                .ok_or(Errno::ENOENT)?;
+            sandbox
+                .apply_metadata_override_to_object(object, path.clone(), &operation)
+                .map_err(|_| Errno::ENOTSUP)?;
+            drop(registry);
+            return self.attr_for_path(&path).map(MetadataOutcome::Applied);
+        }
+        let log_path = sandbox.log_path.clone();
         let waiter: PendingWaiter = Arc::new((Mutex::new(None), Condvar::new()));
         let mut superseded_waiters = Vec::new();
         let mut log_failed = false;
@@ -391,10 +443,16 @@ impl SandboxFs {
         let Some(sandbox) = registry.sandboxes.get(&self.sandbox_name) else {
             return Err(Errno::ENOENT);
         };
-        let Some(protected_path) = operation
-            .protection_paths()
+        let protection_paths = operation.protection_paths();
+        if protection_paths
+            .iter()
+            .all(|path| sandbox.is_passthrough(kind, path, sandbox.path_is_directory(path)))
+        {
+            return Ok(ReadWriteDecision::Proceed);
+        }
+        let Some(protected_path) = protection_paths
             .into_iter()
-            .find(|path| sandbox.is_protected(kind, path))
+            .find(|path| sandbox.is_protected(kind, path, sandbox.path_is_directory(path)))
             .cloned()
         else {
             return Ok(ReadWriteDecision::Proceed);
@@ -536,38 +594,15 @@ impl SandboxFs {
         });
     }
 
-    fn spawn_setxattr_waiter(
-        &self,
-        pending: PendingMetadataOutcome,
-        local_path: PathBuf,
-        name: OsString,
-        value: Vec<u8>,
-        flags: i32,
-        reply: ReplyEmpty,
-    ) {
+    fn spawn_metadata_empty_waiter(&self, pending: PendingMetadataOutcome, reply: ReplyEmpty) {
+        let fs = self.clone();
         std::thread::spawn(move || match wait_for_decision(&pending.waiter) {
-            PendingDecision::Apply => match hostfs::setxattr(&local_path, &name, &value, flags) {
-                Ok(()) => reply.ok(),
-                Err(err) => reply.error(io_to_errno(err)),
-            },
-            PendingDecision::DoNothing => reply.ok(),
-            PendingDecision::Deny => reply.error(Errno::EPERM),
-            PendingDecision::Cancel => reply.error(Errno::ECANCELED),
-        });
-    }
-
-    fn spawn_removexattr_waiter(
-        &self,
-        pending: PendingMetadataOutcome,
-        local_path: PathBuf,
-        name: OsString,
-        reply: ReplyEmpty,
-    ) {
-        std::thread::spawn(move || match wait_for_decision(&pending.waiter) {
-            PendingDecision::Apply => match hostfs::removexattr(&local_path, &name) {
-                Ok(()) => reply.ok(),
-                Err(err) => reply.error(io_to_errno(err)),
-            },
+            PendingDecision::Apply => {
+                match fs.apply_pending_operation(&pending.operation, &pending.object) {
+                    Ok(()) => reply.ok(),
+                    Err(err) => reply.error(err),
+                }
+            }
             PendingDecision::DoNothing => reply.ok(),
             PendingDecision::Deny => reply.error(Errno::EPERM),
             PendingDecision::Cancel => reply.error(Errno::ECANCELED),
@@ -972,14 +1007,41 @@ impl Filesystem for SandboxFs {
             }
             return;
         }
+        let atime = atime.map(resolve_time_or_now);
+        let mtime = mtime.map(resolve_time_or_now);
+        let target_is_dir = self.path_is_directory(&path).unwrap_or(false);
+        if (atime.is_some() || mtime.is_some())
+            && mode.is_none()
+            && uid.is_none()
+            && gid.is_none()
+            && flags.is_none()
+            && self
+                .path_matches_passthrough(ProtectionKind::Metadata, &path, target_is_dir)
+                .unwrap_or(false)
+        {
+            let Some(local_path) = self.local_path_for_ino(ino) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            match hostfs::set_times(&local_path, atime, mtime)
+                .and_then(|()| real_attr(&path, &local_path))
+            {
+                Ok(mut attr) => {
+                    attr.ino = self.remember(&path);
+                    reply.attr(&TTL, &attr);
+                }
+                Err(err) => reply.error(io_to_errno(err)),
+            }
+            return;
+        }
         let operation = MetadataOperation::SetAttr {
             path: path.clone(),
             mode: mode.map(|m| (m & 0o7777) as u16),
             uid,
             gid,
             flags: flags.map(|f| f.bits()),
-            atime: atime.map(resolve_time_or_now),
-            mtime: mtime.map(resolve_time_or_now),
+            atime,
+            mtime,
         };
         match self.begin_metadata_request(RequestIdentity::from_request(req), path, operation) {
             Ok(MetadataOutcome::Applied(attr)) => reply.attr(&TTL, &attr),
@@ -1084,21 +1146,25 @@ impl Filesystem for SandboxFs {
             path: path.clone(),
             name: name.to_string_lossy().into_owned(),
         };
-        match self.begin_metadata_request(RequestIdentity::from_request(req), path, operation) {
-            Ok(MetadataOutcome::Applied(_)) => {
-                match hostfs::setxattr(&local_path, name, value, flags) {
-                    Ok(()) => reply.ok(),
-                    Err(err) => reply.error(io_to_errno(err)),
-                }
+        if self
+            .path_matches_passthrough(
+                ProtectionKind::Metadata,
+                &path,
+                self.path_is_directory(&path).unwrap_or(false),
+            )
+            .unwrap_or(false)
+        {
+            match hostfs::setxattr(&local_path, name, value, flags) {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(io_to_errno(err)),
             }
-            Ok(MetadataOutcome::Pending(pending)) => self.spawn_setxattr_waiter(
-                pending,
-                local_path,
-                name.to_owned(),
-                value.to_vec(),
-                flags,
-                reply,
-            ),
+            return;
+        }
+        match self.begin_metadata_request(RequestIdentity::from_request(req), path, operation) {
+            Ok(MetadataOutcome::Applied(_)) => reply.ok(),
+            Ok(MetadataOutcome::Pending(pending)) => {
+                self.spawn_metadata_empty_waiter(pending, reply)
+            }
             Err(err) => reply.error(err),
         }
     }
@@ -1138,13 +1204,24 @@ impl Filesystem for SandboxFs {
             path: path.clone(),
             name: name.to_string_lossy().into_owned(),
         };
-        match self.begin_metadata_request(RequestIdentity::from_request(req), path, operation) {
-            Ok(MetadataOutcome::Applied(_)) => match hostfs::removexattr(&local_path, name) {
+        if self
+            .path_matches_passthrough(
+                ProtectionKind::Metadata,
+                &path,
+                self.path_is_directory(&path).unwrap_or(false),
+            )
+            .unwrap_or(false)
+        {
+            match hostfs::removexattr(&local_path, name) {
                 Ok(()) => reply.ok(),
                 Err(err) => reply.error(io_to_errno(err)),
-            },
+            }
+            return;
+        }
+        match self.begin_metadata_request(RequestIdentity::from_request(req), path, operation) {
+            Ok(MetadataOutcome::Applied(_)) => reply.ok(),
             Ok(MetadataOutcome::Pending(pending)) => {
-                self.spawn_removexattr_waiter(pending, local_path, name.to_owned(), reply)
+                self.spawn_metadata_empty_waiter(pending, reply)
             }
             Err(err) => reply.error(err),
         }
@@ -1217,6 +1294,28 @@ impl Filesystem for SandboxFs {
             reply.error(Errno::ENOENT);
             return;
         };
+        if self
+            .path_matches_passthrough(ProtectionKind::Write, &path, true)
+            .unwrap_or(false)
+        {
+            let local_path = match self.local_path_for_child(parent, name) {
+                Ok(local_path) => local_path,
+                Err(err) => {
+                    reply.error(err);
+                    return;
+                }
+            };
+            match hostfs::mkdir(&local_path, _mode & 0o7777)
+                .and_then(|()| real_attr(&path, &local_path))
+            {
+                Ok(mut attr) => {
+                    attr.ino = self.remember(&path);
+                    reply.entry(&TTL, &attr, Generation(0));
+                }
+                Err(err) => reply.error(io_to_errno(err)),
+            }
+            return;
+        }
         match self.authorize_read_write(
             RequestIdentity::from_request(req),
             ReadWriteOperation::Mkdir { path },
@@ -1324,6 +1423,23 @@ impl Filesystem for SandboxFs {
             reply.error(Errno::ENOENT);
             return;
         };
+        if self
+            .path_matches_passthrough(ProtectionKind::Write, &path, true)
+            .unwrap_or(false)
+        {
+            let local_path = match self.local_path_for_child(parent, name) {
+                Ok(local_path) => local_path,
+                Err(err) => {
+                    reply.error(err);
+                    return;
+                }
+            };
+            match hostfs::rmdir(&local_path) {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(io_to_errno(err)),
+            }
+            return;
+        }
         match self.authorize_read_write(
             RequestIdentity::from_request(req),
             ReadWriteOperation::Rmdir { path },
@@ -1496,8 +1612,9 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::state::{
-        ProtectionKind, ReadWriteAccessGrant, ReadWriteGrantLifetime, ReadWriteGrantSubject,
-        ReadWriteOperation, Sandbox, TrustedOperation, TrustedPathScope, epoch_millis,
+        PolicyPattern, ProtectionKind, ReadWriteAccessGrant, ReadWriteGrantLifetime,
+        ReadWriteGrantSubject, ReadWriteOperation, Sandbox, TrustedOperation, TrustedPathScope,
+        epoch_millis,
     };
 
     fn registry_with_file(temp: &TempDir, log_path: PathBuf) -> Arc<Mutex<SandboxRegistry>> {
@@ -1517,6 +1634,19 @@ mod tests {
             .sandboxes
             .insert("demo".to_string(), sandbox);
         registry
+    }
+
+    fn protect_metadata(registry: &Arc<Mutex<SandboxRegistry>>, pattern: &str) {
+        registry
+            .lock()
+            .unwrap()
+            .sandboxes
+            .get_mut("demo")
+            .unwrap()
+            .protect(
+                ProtectionKind::Metadata,
+                PolicyPattern::new(pattern).unwrap(),
+            );
     }
 
     fn wait_for_pending(registry: &Arc<Mutex<SandboxRegistry>>) -> u64 {
@@ -2079,6 +2209,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let log_path = temp.path().join("logs/demo.log");
         let registry = registry_with_file(&temp, log_path.clone());
+        protect_metadata(&registry, "/data/**");
         let writer = log::LogWriter::new();
         let fs = SandboxFs::new("demo", Arc::clone(&registry), writer.handle());
         let path = SandboxPath::new("/data/file").unwrap();
@@ -2178,6 +2309,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let log_path = temp.path().join("logs/demo.log");
         let registry = registry_with_file(&temp, log_path.clone());
+        protect_metadata(&registry, "/data/**");
         let writer = log::LogWriter::new();
         let fs = SandboxFs::new("demo", Arc::clone(&registry), writer.handle());
         let identity = RequestIdentity {
@@ -2255,6 +2387,7 @@ mod tests {
             .unwrap()
             .sandboxes
             .insert("demo".to_string(), sandbox);
+        protect_metadata(&registry, "/data/**");
         let writer = log::LogWriter::new();
         let fs = SandboxFs::new("demo", Arc::clone(&registry), writer.handle());
         let path = SandboxPath::new("/data/file").unwrap();
@@ -2321,6 +2454,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let log_path = temp.path().join("logs/demo.log");
         let registry = registry_with_file(&temp, log_path.clone());
+        protect_metadata(&registry, "/data/**");
         let writer = log::LogWriter::new();
         let fs = SandboxFs::new("demo", Arc::clone(&registry), writer.handle());
         let identity = RequestIdentity {
@@ -2391,6 +2525,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let log_path = temp.path().join("logs/demo.log");
         let registry = registry_with_file(&temp, log_path.clone());
+        protect_metadata(&registry, "/data/**");
         let writer = log::LogWriter::new();
         let fs = SandboxFs::new("demo", Arc::clone(&registry), writer.handle());
         let path = SandboxPath::new("/data/file").unwrap();
@@ -2468,6 +2603,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let log_path = temp.path().join("logs/demo.log");
         let registry = registry_with_file(&temp, log_path);
+        protect_metadata(&registry, "/data/**");
         std::fs::write(temp.path().join("local/other"), "world").unwrap();
         let writer = log::LogWriter::new();
         let fs = SandboxFs::new("demo", registry, writer.handle());

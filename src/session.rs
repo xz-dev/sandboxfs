@@ -19,7 +19,7 @@ use crate::path::SandboxPath;
 use crate::process_info::{ProcessInfoProvider, SysinfoProcessInfoProvider};
 use crate::runtime::RuntimePaths;
 use crate::state::{
-    AttachMount, PendingDecision, PendingRequest, PendingWaiter, ProtectionKind,
+    AttachMount, PendingDecision, PendingRequest, PendingWaiter, PolicyPattern, ProtectionKind,
     ReadWriteAccessGrant, ReadWriteGrantLifetime, ReadWriteGrantLifetimeRequest,
     ReadWriteGrantOptions, ReadWriteGrantSubject, Sandbox, SandboxRegistry, TrustedOperation,
     TrustedPathScope, duration_expires_at, grant_pattern_matches,
@@ -145,11 +145,28 @@ impl SessionState {
                 kind,
                 pattern,
             } => self.unprotect(&name, kind, pattern),
+            Request::Passthrough {
+                name,
+                kind,
+                pattern,
+            } => self.passthrough(&name, kind, pattern),
+            Request::Unpassthrough {
+                name,
+                kind,
+                pattern,
+            } => self.unpassthrough(&name, kind, pattern),
             Request::ListProtection {
                 name,
                 include_read,
                 include_write,
-            } => self.list_protection(&name, include_read, include_write),
+                include_metadata,
+            } => self.list_protection(&name, include_read, include_write, include_metadata),
+            Request::ListPassthrough {
+                name,
+                include_read,
+                include_write,
+                include_metadata,
+            } => self.list_passthrough(&name, include_read, include_write, include_metadata),
             Request::ListMounts { name } => self.list_mounts(&name),
             Request::Metadata { name } => self.metadata(&name),
             Request::BeginTrustedOperation {
@@ -386,7 +403,12 @@ impl SessionState {
         Ok(Response::Ok)
     }
 
-    fn protect(&self, name: &str, kind: ProtectionKind, pattern: SandboxPath) -> Result<Response> {
+    fn protect(
+        &self,
+        name: &str,
+        kind: ProtectionKind,
+        pattern: PolicyPattern,
+    ) -> Result<Response> {
         let mut registry = self.registry.lock().unwrap();
         let id = registry.next_operation_id();
         let sandbox = registry
@@ -411,7 +433,7 @@ impl SessionState {
         &self,
         name: &str,
         kind: ProtectionKind,
-        pattern: SandboxPath,
+        pattern: PolicyPattern,
     ) -> Result<Response> {
         let mut registry = self.registry.lock().unwrap();
         let id = registry.next_operation_id();
@@ -419,7 +441,7 @@ impl SessionState {
             .sandboxes
             .get_mut(name)
             .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
-        let result = sandbox.unprotect(kind, &pattern);
+        let result = sandbox.unprotect(kind, pattern.clone());
         self.log_writer.append(
             &sandbox.log_path,
             log::format_log_line(
@@ -433,11 +455,64 @@ impl SessionState {
         Ok(Response::Ok)
     }
 
+    fn passthrough(
+        &self,
+        name: &str,
+        kind: ProtectionKind,
+        pattern: PolicyPattern,
+    ) -> Result<Response> {
+        let mut registry = self.registry.lock().unwrap();
+        let id = registry.next_operation_id();
+        let sandbox = registry
+            .sandboxes
+            .get_mut(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        let result = sandbox.add_passthrough(kind, pattern.clone());
+        self.log_writer.append(
+            &sandbox.log_path,
+            log::format_log_line(
+                id,
+                &format!(
+                    "passthrough kind={kind} pattern={pattern} result={}",
+                    result.log_name()
+                ),
+            ),
+        )?;
+        Ok(Response::Ok)
+    }
+
+    fn unpassthrough(
+        &self,
+        name: &str,
+        kind: ProtectionKind,
+        pattern: PolicyPattern,
+    ) -> Result<Response> {
+        let mut registry = self.registry.lock().unwrap();
+        let id = registry.next_operation_id();
+        let sandbox = registry
+            .sandboxes
+            .get_mut(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        let result = sandbox.remove_passthrough(kind, pattern.clone());
+        self.log_writer.append(
+            &sandbox.log_path,
+            log::format_log_line(
+                id,
+                &format!(
+                    "unpassthrough kind={kind} pattern={pattern} result={}",
+                    result.log_name()
+                ),
+            ),
+        )?;
+        Ok(Response::Ok)
+    }
+
     fn list_protection(
         &self,
         name: &str,
         include_read: bool,
         include_write: bool,
+        include_metadata: bool,
     ) -> Result<Response> {
         let registry = self.registry.lock().unwrap();
         let sandbox = registry
@@ -445,7 +520,24 @@ impl SessionState {
             .get(name)
             .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
         Ok(Response::ProtectionRules {
-            items: sandbox.protection_rules(include_read, include_write),
+            items: sandbox.protection_rules(include_read, include_write, include_metadata),
+        })
+    }
+
+    fn list_passthrough(
+        &self,
+        name: &str,
+        include_read: bool,
+        include_write: bool,
+        include_metadata: bool,
+    ) -> Result<Response> {
+        let registry = self.registry.lock().unwrap();
+        let sandbox = registry
+            .sandboxes
+            .get(name)
+            .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
+        Ok(Response::PassthroughRules {
+            items: sandbox.passthrough_rules(include_read, include_write, include_metadata),
         })
     }
 

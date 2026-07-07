@@ -262,6 +262,11 @@ fn attach_xattr_passthrough() {
         .success();
     session
         .sandbox_cmd()
+        .args(["passthrough-metadata", "/data/**"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
         .args(["attach", mountpoint.to_str().unwrap()])
         .assert()
         .success();
@@ -277,53 +282,19 @@ fn attach_xattr_passthrough() {
             .any(|window| window == b"user.before\0")
     );
 
-    let child = std::thread::spawn({
-        let path = mountpoint.join("data/file");
-        move || set_xattr(&path, "user.after", b"two")
-    });
-    assert!(wait_until(Duration::from_secs(3), || {
-        session
-            .sandbox_cmd()
-            .arg("allow")
-            .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).contains("SETXATTR name=user.after"))
-            .unwrap_or(false)
-    }));
-    let pending =
-        String::from_utf8(session.sandbox_cmd().arg("allow").output().unwrap().stdout).unwrap();
-    let id = pending.split_whitespace().next().unwrap().to_string();
-    session
-        .sandbox_cmd()
-        .args(["allow", &id])
-        .assert()
-        .success();
-    child.join().unwrap().unwrap();
+    set_xattr(&mountpoint.join("data/file"), "user.after", b"two").unwrap();
     assert_eq!(
         get_xattr(&local.join("file"), "user.after").unwrap(),
         b"two"
     );
-
-    let child = std::thread::spawn({
-        let path = mountpoint.join("data/file");
-        move || remove_xattr(&path, "user.after")
-    });
-    assert!(wait_until(Duration::from_secs(3), || {
-        session
-            .sandbox_cmd()
-            .arg("allow")
-            .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).contains("REMOVEXATTR name=user.after"))
-            .unwrap_or(false)
-    }));
     let pending =
         String::from_utf8(session.sandbox_cmd().arg("allow").output().unwrap().stdout).unwrap();
-    let id = pending.split_whitespace().next().unwrap().to_string();
-    session
-        .sandbox_cmd()
-        .args(["allow", &id])
-        .assert()
-        .success();
-    child.join().unwrap().unwrap();
+    assert!(
+        pending.trim().is_empty(),
+        "unexpected pending xattr request: {pending}"
+    );
+
+    remove_xattr(&mountpoint.join("data/file"), "user.after").unwrap();
     let err = get_xattr(&local.join("file"), "user.after").unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::ENODATA));
 }
@@ -380,6 +351,11 @@ fn protected_xattr_write_is_metadata_gated() {
         .success();
     session
         .sandbox_cmd()
+        .args(["protect-metadata", "/data/**"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
         .args(["attach", mountpoint.to_str().unwrap()])
         .assert()
         .success();
@@ -406,10 +382,7 @@ fn protected_xattr_write_is_metadata_gated() {
         .assert()
         .success();
     child.join().unwrap().unwrap();
-    assert_eq!(
-        get_xattr(&local.join("file"), "user.gated").unwrap(),
-        b"value"
-    );
+    assert!(get_xattr(&local.join("file"), "user.gated").is_err());
 
     let log = session_log(&session);
     assert_log_line_contains(
@@ -722,6 +695,11 @@ fn direct_touch_pending_can_be_allowed_without_host_mutation() {
         .success();
     session
         .sandbox_cmd()
+        .args(["protect-metadata", "/data/**"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
         .args(["attach", mountpoint.to_str().unwrap()])
         .assert()
         .success();
@@ -844,6 +822,11 @@ fn direct_chattr_pending_can_be_allowed() {
     session
         .sandbox_cmd()
         .args(["mount", local.to_str().unwrap(), "/data"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["protect-metadata", "/data/**"])
         .assert()
         .success();
     session
@@ -998,6 +981,45 @@ fn stress_multiple_pending_viewers_do_not_consume_request() {
 
 #[test]
 #[ignore]
+fn passthrough_write_allows_mkdir_and_rmdir_without_enabling_file_writes() {
+    require_fuse();
+    if !fuse_enabled() {
+        return;
+    }
+    let session = RunningSession::start("demo_fuse_passthrough_write_dirs");
+    let local = session.temp.path().join("local");
+    let mountpoint = session.temp.path().join("mnt");
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&mountpoint).unwrap();
+
+    session
+        .sandbox_cmd()
+        .args(["mount", local.to_str().unwrap(), "/data"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["passthrough-write", "/data/locks/"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["attach", mountpoint.to_str().unwrap()])
+        .assert()
+        .success();
+
+    fs::create_dir(mountpoint.join("data/locks")).unwrap();
+    assert!(local.join("locks").is_dir());
+    fs::remove_dir(mountpoint.join("data/locks")).unwrap();
+    assert!(!local.join("locks").exists());
+
+    let err = fs::write(mountpoint.join("data/file"), "blocked").unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EROFS));
+    assert!(!local.join("file").exists());
+}
+
+#[test]
+#[ignore]
 fn protected_symlink_write_intent_is_gated_without_host_mutation() {
     require_fuse();
     if !fuse_enabled() {
@@ -1134,6 +1156,11 @@ fn direct_chmod_pending_can_be_allowed_denied_or_do_nothing() {
     session
         .sandbox_cmd()
         .args(["mount", local.to_str().unwrap(), "/data"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["protect-metadata", "/data/**"])
         .assert()
         .success();
     session

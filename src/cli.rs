@@ -15,8 +15,9 @@ use crate::path::{SandboxPath, rewrite_sandbox_path_arg};
 use crate::runtime::RuntimePaths;
 use crate::session;
 use crate::state::{
-    DEFAULT_READ_WRITE_GRANT_DURATION, PendingRequest, ProtectionKind, ProtectionRule,
-    ReadWriteGrantLifetimeRequest, ReadWriteGrantOptions, TrustedPathScope,
+    DEFAULT_READ_WRITE_GRANT_DURATION, PassthroughRule, PendingRequest, PolicyPattern,
+    ProtectionKind, ProtectionRule, ReadWriteGrantLifetimeRequest, ReadWriteGrantOptions,
+    TrustedPathScope,
 };
 use crate::{Error, Result};
 
@@ -72,10 +73,34 @@ enum SandboxCommand {
     ProtectWrite {
         pattern: String,
     },
+    ProtectMetadata {
+        pattern: String,
+    },
     UnprotectRead {
         pattern: String,
     },
     UnprotectWrite {
+        pattern: String,
+    },
+    UnprotectMetadata {
+        pattern: String,
+    },
+    PassthroughRead {
+        pattern: String,
+    },
+    PassthroughWrite {
+        pattern: String,
+    },
+    PassthroughMetadata {
+        pattern: String,
+    },
+    UnpassthroughRead {
+        pattern: String,
+    },
+    UnpassthroughWrite {
+        pattern: String,
+    },
+    UnpassthroughMetadata {
         pattern: String,
     },
     ListProtection {
@@ -83,6 +108,16 @@ enum SandboxCommand {
         read: bool,
         #[arg(long, action = ArgAction::SetTrue)]
         write: bool,
+        #[arg(long, action = ArgAction::SetTrue)]
+        metadata: bool,
+    },
+    ListPassthrough {
+        #[arg(long, action = ArgAction::SetTrue)]
+        read: bool,
+        #[arg(long, action = ArgAction::SetTrue)]
+        write: bool,
+        #[arg(long, action = ArgAction::SetTrue)]
+        metadata: bool,
     },
     Chmod {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -216,33 +251,100 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
             runtime,
             &name,
             ProtectionKind::Read,
-            SandboxPath::new(pattern)?,
+            PolicyPattern::new(pattern)?,
         ),
         SandboxCommand::ProtectWrite { pattern } => protect(
             runtime,
             &name,
             ProtectionKind::Write,
-            SandboxPath::new(pattern)?,
+            PolicyPattern::new(pattern)?,
+        ),
+        SandboxCommand::ProtectMetadata { pattern } => protect(
+            runtime,
+            &name,
+            ProtectionKind::Metadata,
+            PolicyPattern::new(pattern)?,
         ),
         SandboxCommand::UnprotectRead { pattern } => unprotect(
             runtime,
             &name,
             ProtectionKind::Read,
-            SandboxPath::new(pattern)?,
+            PolicyPattern::new(pattern)?,
         ),
         SandboxCommand::UnprotectWrite { pattern } => unprotect(
             runtime,
             &name,
             ProtectionKind::Write,
-            SandboxPath::new(pattern)?,
+            PolicyPattern::new(pattern)?,
         ),
-        SandboxCommand::ListProtection { read, write } => print_response(send(
+        SandboxCommand::UnprotectMetadata { pattern } => unprotect(
+            runtime,
+            &name,
+            ProtectionKind::Metadata,
+            PolicyPattern::new(pattern)?,
+        ),
+        SandboxCommand::PassthroughRead { pattern } => passthrough(
+            runtime,
+            &name,
+            ProtectionKind::Read,
+            PolicyPattern::new(pattern)?,
+        ),
+        SandboxCommand::PassthroughWrite { pattern } => passthrough(
+            runtime,
+            &name,
+            ProtectionKind::Write,
+            PolicyPattern::new(pattern)?,
+        ),
+        SandboxCommand::PassthroughMetadata { pattern } => passthrough(
+            runtime,
+            &name,
+            ProtectionKind::Metadata,
+            PolicyPattern::new(pattern)?,
+        ),
+        SandboxCommand::UnpassthroughRead { pattern } => unpassthrough(
+            runtime,
+            &name,
+            ProtectionKind::Read,
+            PolicyPattern::new(pattern)?,
+        ),
+        SandboxCommand::UnpassthroughWrite { pattern } => unpassthrough(
+            runtime,
+            &name,
+            ProtectionKind::Write,
+            PolicyPattern::new(pattern)?,
+        ),
+        SandboxCommand::UnpassthroughMetadata { pattern } => unpassthrough(
+            runtime,
+            &name,
+            ProtectionKind::Metadata,
+            PolicyPattern::new(pattern)?,
+        ),
+        SandboxCommand::ListProtection {
+            read,
+            write,
+            metadata,
+        } => print_response(send(
             runtime,
             &name,
             &Request::ListProtection {
                 name: name.clone(),
                 include_read: read,
                 include_write: write,
+                include_metadata: metadata,
+            },
+        )?),
+        SandboxCommand::ListPassthrough {
+            read,
+            write,
+            metadata,
+        } => print_response(send(
+            runtime,
+            &name,
+            &Request::ListPassthrough {
+                name: name.clone(),
+                include_read: read,
+                include_write: write,
+                include_metadata: metadata,
             },
         )?),
         SandboxCommand::Chmod { args } => run_trusted_command(runtime, &name, "chmod", args),
@@ -379,7 +481,7 @@ fn protect(
     runtime: &RuntimePaths,
     name: &str,
     kind: ProtectionKind,
-    pattern: SandboxPath,
+    pattern: PolicyPattern,
 ) -> Result<i32> {
     print_response(send(
         runtime,
@@ -396,12 +498,46 @@ fn unprotect(
     runtime: &RuntimePaths,
     name: &str,
     kind: ProtectionKind,
-    pattern: SandboxPath,
+    pattern: PolicyPattern,
 ) -> Result<i32> {
     print_response(send(
         runtime,
         name,
         &Request::Unprotect {
+            name: name.to_string(),
+            kind,
+            pattern,
+        },
+    )?)
+}
+
+fn passthrough(
+    runtime: &RuntimePaths,
+    name: &str,
+    kind: ProtectionKind,
+    pattern: PolicyPattern,
+) -> Result<i32> {
+    print_response(send(
+        runtime,
+        name,
+        &Request::Passthrough {
+            name: name.to_string(),
+            kind,
+            pattern,
+        },
+    )?)
+}
+
+fn unpassthrough(
+    runtime: &RuntimePaths,
+    name: &str,
+    kind: ProtectionKind,
+    pattern: PolicyPattern,
+) -> Result<i32> {
+    print_response(send(
+        runtime,
+        name,
+        &Request::Unpassthrough {
             name: name.to_string(),
             kind,
             pattern,
@@ -446,6 +582,13 @@ fn print_response(response: Response) -> Result<i32> {
             }
             Ok(0)
         }
+        Response::PassthroughRules { items } => {
+            let text = format_passthrough_rules(&items);
+            if !text.is_empty() {
+                println!("{text}");
+            }
+            Ok(0)
+        }
         Response::Trusted { .. } => Ok(0),
         Response::Error { message } => Err(Error::msg(message)),
     }
@@ -463,6 +606,14 @@ fn format_pending_items(items: &[PendingRequest]) -> String {
 }
 
 fn format_protection_rules(items: &[ProtectionRule]) -> String {
+    items
+        .iter()
+        .map(|item| format!("{} {}", item.kind, item.pattern))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_passthrough_rules(items: &[PassthroughRule]) -> String {
     items
         .iter()
         .map(|item| format!("{} {}", item.kind, item.pattern))

@@ -124,6 +124,10 @@ sf hide "$HOST_HOME"
 sf mount "$HOST_HOME/.pi" "$HOST_HOME/.pi"
 sf mount "$HOST_HOME/.agents" "$HOST_HOME/.agents"
 sf mount "$HOST_CWD" "$HOST_CWD"
+sf passthrough-write "$HOST_HOME/.pi/agent/settings.json.lock"
+sf passthrough-metadata "$HOST_HOME/.pi/agent/settings.json.lock"
+sf passthrough-write "$HOST_HOME/.pi/agent/trust.json.lock"
+sf passthrough-metadata "$HOST_HOME/.pi/agent/trust.json.lock"
 
 sf attach "$ATTACH_DIR"
 
