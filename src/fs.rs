@@ -1368,9 +1368,7 @@ fn check_access(attr: &FileAttr, uid: u32, gid: u32, mask: AccessFlags) -> bool 
         return true;
     }
     let perm = u32::from(attr.perm);
-    let shift = if uid == 0 {
-        6
-    } else if uid == attr.uid {
+    let shift = if uid == 0 || uid == attr.uid {
         6
     } else if gid == attr.gid {
         3
