@@ -5,9 +5,10 @@ set -euo pipefail
 #
 # sandboxfs is used here to make the agent's filesystem view and operations
 # observable, not to provide a strong isolation boundary. The view starts from
-# host / and only hides /home by default. The wrapped process inherits the
-# caller's environment; this script only replaces PATH with a small system PATH
-# so hidden home PATH entries are not accidentally re-exposed.
+# host /, hides /home and $HOME, then re-exposes $HOME/.pi and the current
+# working directory. The wrapped process inherits the caller's environment; this
+# script only replaces PATH with a small system PATH so hidden home PATH entries
+# are not accidentally re-exposed.
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 HOST_CWD=$(pwd -P)
@@ -115,18 +116,13 @@ if [[ ! -S $SOCKET ]]; then
     exit 1
 fi
 
-# Base view: root redirect for observability, with only /home hidden by default.
+# Base view: root redirect for observability, with home details hidden and only
+# the pi config directory plus the current working directory re-exposed.
 sf mount / /
 sf hide /home
-
-# If the caller's pi config lives under hidden /home, re-expose only that config
-# directory so pi can run while other /home details remain hidden.
-PI_HOME_DIR=$HOST_HOME/.pi
-if [[ $PI_HOME_DIR == /home/* && -d $PI_HOME_DIR ]]; then
-    sf mount "$PI_HOME_DIR" "$PI_HOME_DIR"
-elif [[ $PI_HOME_DIR == /home/* ]]; then
-    printf 'pi-sandbox: warning: %s does not exist; pi config may be unavailable\n' "$PI_HOME_DIR" >&2
-fi
+sf hide "$HOST_HOME"
+sf mount "$HOST_HOME/.pi" "$HOST_HOME/.pi"
+sf mount "$HOST_CWD" "$HOST_CWD"
 
 sf attach "$ATTACH_DIR"
 
