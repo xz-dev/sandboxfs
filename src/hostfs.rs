@@ -41,13 +41,13 @@ pub fn statfs(path: &Path) -> std::io::Result<StatFs> {
 pub fn getxattr(path: &Path, name: &OsStr) -> std::io::Result<Vec<u8>> {
     let path = cstring(path.as_os_str())?;
     let name = cstring(name)?;
-    let size = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    let size = unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
     if size < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let mut value = vec![0; size as usize];
     let read = unsafe {
-        libc::getxattr(
+        libc::lgetxattr(
             path.as_ptr(),
             name.as_ptr(),
             value.as_mut_ptr().cast(),
@@ -63,12 +63,12 @@ pub fn getxattr(path: &Path, name: &OsStr) -> std::io::Result<Vec<u8>> {
 
 pub fn listxattr(path: &Path) -> std::io::Result<Vec<u8>> {
     let path = cstring(path.as_os_str())?;
-    let size = unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
+    let size = unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
     if size < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let mut names = vec![0; size as usize];
-    let read = unsafe { libc::listxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+    let read = unsafe { libc::llistxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
     if read < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -80,7 +80,7 @@ pub fn setxattr(path: &Path, name: &OsStr, value: &[u8], flags: i32) -> std::io:
     let path = cstring(path.as_os_str())?;
     let name = cstring(name)?;
     let result = unsafe {
-        libc::setxattr(
+        libc::lsetxattr(
             path.as_ptr(),
             name.as_ptr(),
             value.as_ptr().cast(),
@@ -97,7 +97,7 @@ pub fn setxattr(path: &Path, name: &OsStr, value: &[u8], flags: i32) -> std::io:
 pub fn removexattr(path: &Path, name: &OsStr) -> std::io::Result<()> {
     let path = cstring(path.as_os_str())?;
     let name = cstring(name)?;
-    let result = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) };
+    let result = unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) };
     if result < 0 {
         return Err(std::io::Error::last_os_error());
     }

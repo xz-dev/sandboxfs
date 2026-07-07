@@ -154,14 +154,19 @@ impl SandboxFs {
         Ok(apply_override(attr, sandbox.metadata.get(path)))
     }
 
-    fn local_path_for_ino(&self, ino: INodeNo) -> Option<PathBuf> {
+    fn path_and_local_path_for_ino(&self, ino: INodeNo) -> Option<(SandboxPath, PathBuf)> {
         let path = self.path_for_ino(ino)?;
         let registry = self.registry.lock().unwrap();
         let sandbox = registry.sandboxes.get(&self.sandbox_name)?;
         match sandbox.resolve(&path)? {
-            ResolvedPath::Real { local_path, .. } => Some(local_path),
+            ResolvedPath::Real { local_path, .. } => Some((path, local_path)),
             ResolvedPath::VirtualDir { .. } => None,
         }
+    }
+
+    fn local_path_for_ino(&self, ino: INodeNo) -> Option<PathBuf> {
+        self.path_and_local_path_for_ino(ino)
+            .map(|(_, local_path)| local_path)
     }
 
     fn path_child(&self, parent: INodeNo, name: &OsStr) -> std::result::Result<SandboxPath, Errno> {
@@ -511,6 +516,44 @@ impl SandboxFs {
                 Err(err) => reply.error(err),
             },
             PendingDecision::DoNothing => reply.ioctl(0, &[]),
+            PendingDecision::Deny => reply.error(Errno::EPERM),
+            PendingDecision::Cancel => reply.error(Errno::ECANCELED),
+        });
+    }
+
+    fn spawn_setxattr_waiter(
+        &self,
+        pending: PendingMetadataOutcome,
+        local_path: PathBuf,
+        name: OsString,
+        value: Vec<u8>,
+        flags: i32,
+        reply: ReplyEmpty,
+    ) {
+        std::thread::spawn(move || match wait_for_decision(&pending.waiter) {
+            PendingDecision::Apply => match hostfs::setxattr(&local_path, &name, &value, flags) {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(io_to_errno(err)),
+            },
+            PendingDecision::DoNothing => reply.ok(),
+            PendingDecision::Deny => reply.error(Errno::EPERM),
+            PendingDecision::Cancel => reply.error(Errno::ECANCELED),
+        });
+    }
+
+    fn spawn_removexattr_waiter(
+        &self,
+        pending: PendingMetadataOutcome,
+        local_path: PathBuf,
+        name: OsString,
+        reply: ReplyEmpty,
+    ) {
+        std::thread::spawn(move || match wait_for_decision(&pending.waiter) {
+            PendingDecision::Apply => match hostfs::removexattr(&local_path, &name) {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(io_to_errno(err)),
+            },
+            PendingDecision::DoNothing => reply.ok(),
             PendingDecision::Deny => reply.error(Errno::EPERM),
             PendingDecision::Cancel => reply.error(Errno::ECANCELED),
         });
@@ -1006,7 +1049,7 @@ impl Filesystem for SandboxFs {
 
     fn setxattr(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         name: &OsStr,
         value: &[u8],
@@ -1018,13 +1061,30 @@ impl Filesystem for SandboxFs {
             reply.error(Errno::ENOTSUP);
             return;
         }
-        let Some(local_path) = self.local_path_for_ino(ino) else {
+        let Some((path, local_path)) = self.path_and_local_path_for_ino(ino) else {
             reply.error(Errno::ENOENT);
             return;
         };
-        match hostfs::setxattr(&local_path, name, value, flags) {
-            Ok(()) => reply.ok(),
-            Err(err) => reply.error(io_to_errno(err)),
+        let operation = MetadataOperation::SetXattr {
+            path: path.clone(),
+            name: name.to_string_lossy().into_owned(),
+        };
+        match self.begin_metadata_request(RequestIdentity::from_request(req), path, operation) {
+            Ok(MetadataOutcome::Applied(_)) => {
+                match hostfs::setxattr(&local_path, name, value, flags) {
+                    Ok(()) => reply.ok(),
+                    Err(err) => reply.error(io_to_errno(err)),
+                }
+            }
+            Ok(MetadataOutcome::Pending(pending)) => self.spawn_setxattr_waiter(
+                pending,
+                local_path,
+                name.to_owned(),
+                value.to_vec(),
+                flags,
+                reply,
+            ),
+            Err(err) => reply.error(err),
         }
     }
 
@@ -1054,14 +1114,24 @@ impl Filesystem for SandboxFs {
         }
     }
 
-    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let Some(local_path) = self.local_path_for_ino(ino) else {
+    fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some((path, local_path)) = self.path_and_local_path_for_ino(ino) else {
             reply.error(Errno::ENOENT);
             return;
         };
-        match hostfs::removexattr(&local_path, name) {
-            Ok(()) => reply.ok(),
-            Err(err) => reply.error(io_to_errno(err)),
+        let operation = MetadataOperation::RemoveXattr {
+            path: path.clone(),
+            name: name.to_string_lossy().into_owned(),
+        };
+        match self.begin_metadata_request(RequestIdentity::from_request(req), path, operation) {
+            Ok(MetadataOutcome::Applied(_)) => match hostfs::removexattr(&local_path, name) {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(io_to_errno(err)),
+            },
+            Ok(MetadataOutcome::Pending(pending)) => {
+                self.spawn_removexattr_waiter(pending, local_path, name.to_owned(), reply)
+            }
+            Err(err) => reply.error(err),
         }
     }
 

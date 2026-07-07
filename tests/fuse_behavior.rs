@@ -1,6 +1,8 @@
 mod common;
 
+use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime};
@@ -116,18 +118,18 @@ fn pending_ids(output: &str) -> Vec<String> {
 }
 
 fn c_string_path(path: &Path) -> std::ffi::CString {
-    std::ffi::CString::new(path.to_str().unwrap()).unwrap()
+    c_string(path.as_os_str())
 }
 
-fn c_string(value: &str) -> std::ffi::CString {
-    std::ffi::CString::new(value).unwrap()
+fn c_string(value: &OsStr) -> std::ffi::CString {
+    std::ffi::CString::new(value.as_bytes()).unwrap()
 }
 
 fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
     let path = c_string_path(path);
-    let name = c_string(name);
+    let name = c_string(OsStr::new(name));
     let result = unsafe {
-        libc::setxattr(
+        libc::lsetxattr(
             path.as_ptr(),
             name.as_ptr(),
             value.as_ptr().cast(),
@@ -144,14 +146,14 @@ fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
 
 fn get_xattr(path: &Path, name: &str) -> std::io::Result<Vec<u8>> {
     let path = c_string_path(path);
-    let name = c_string(name);
-    let size = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    let name = c_string(OsStr::new(name));
+    let size = unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
     if size < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let mut value = vec![0; size as usize];
     let read = unsafe {
-        libc::getxattr(
+        libc::lgetxattr(
             path.as_ptr(),
             name.as_ptr(),
             value.as_mut_ptr().cast(),
@@ -167,12 +169,12 @@ fn get_xattr(path: &Path, name: &str) -> std::io::Result<Vec<u8>> {
 
 fn list_xattr(path: &Path) -> std::io::Result<Vec<u8>> {
     let path = c_string_path(path);
-    let size = unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
+    let size = unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
     if size < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let mut names = vec![0; size as usize];
-    let read = unsafe { libc::listxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+    let read = unsafe { libc::llistxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
     if read < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -182,8 +184,8 @@ fn list_xattr(path: &Path) -> std::io::Result<Vec<u8>> {
 
 fn remove_xattr(path: &Path, name: &str) -> std::io::Result<()> {
     let path = c_string_path(path);
-    let name = c_string(name);
-    let result = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) };
+    let name = c_string(OsStr::new(name));
+    let result = unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) };
     if result == 0 {
         Ok(())
     } else {
@@ -275,14 +277,146 @@ fn attach_xattr_passthrough() {
             .any(|window| window == b"user.before\0")
     );
 
-    set_xattr(&mountpoint.join("data/file"), "user.after", b"two").unwrap();
+    let child = std::thread::spawn({
+        let path = mountpoint.join("data/file");
+        move || set_xattr(&path, "user.after", b"two")
+    });
+    assert!(wait_until(Duration::from_secs(3), || {
+        session
+            .sandbox_cmd()
+            .arg("allow")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).contains("SETXATTR name=user.after"))
+            .unwrap_or(false)
+    }));
+    let pending =
+        String::from_utf8(session.sandbox_cmd().arg("allow").output().unwrap().stdout).unwrap();
+    let id = pending.split_whitespace().next().unwrap().to_string();
+    session
+        .sandbox_cmd()
+        .args(["allow", &id])
+        .assert()
+        .success();
+    child.join().unwrap().unwrap();
     assert_eq!(
         get_xattr(&local.join("file"), "user.after").unwrap(),
         b"two"
     );
-    remove_xattr(&mountpoint.join("data/file"), "user.after").unwrap();
+
+    let child = std::thread::spawn({
+        let path = mountpoint.join("data/file");
+        move || remove_xattr(&path, "user.after")
+    });
+    assert!(wait_until(Duration::from_secs(3), || {
+        session
+            .sandbox_cmd()
+            .arg("allow")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).contains("REMOVEXATTR name=user.after"))
+            .unwrap_or(false)
+    }));
+    let pending =
+        String::from_utf8(session.sandbox_cmd().arg("allow").output().unwrap().stdout).unwrap();
+    let id = pending.split_whitespace().next().unwrap().to_string();
+    session
+        .sandbox_cmd()
+        .args(["allow", &id])
+        .assert()
+        .success();
+    child.join().unwrap().unwrap();
     let err = get_xattr(&local.join("file"), "user.after").unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::ENODATA));
+}
+
+#[test]
+#[ignore]
+fn attach_xattr_passthrough_does_not_follow_symlink_inode() {
+    require_fuse();
+    if !fuse_enabled() {
+        return;
+    }
+    let session = RunningSession::start("demo_fuse_xattr_symlink");
+    let local = session.temp.path().join("local");
+    let mountpoint = session.temp.path().join("mnt");
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&mountpoint).unwrap();
+    fs::write(local.join("target"), "hello").unwrap();
+    std::os::unix::fs::symlink("target", local.join("link")).unwrap();
+    set_xattr(&local.join("target"), "user.target", b"target-value").unwrap();
+
+    session
+        .sandbox_cmd()
+        .args(["mount", local.to_str().unwrap(), "/data"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["attach", mountpoint.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let err = get_xattr(&mountpoint.join("data/link"), "user.target").unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ENODATA));
+}
+
+#[test]
+#[ignore]
+fn protected_xattr_write_is_metadata_gated() {
+    require_fuse();
+    if !fuse_enabled() {
+        return;
+    }
+    let session = RunningSession::start("demo_fuse_xattr_metadata_gate");
+    let local = session.temp.path().join("local");
+    let mountpoint = session.temp.path().join("mnt");
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&mountpoint).unwrap();
+    fs::write(local.join("file"), "hello").unwrap();
+
+    session
+        .sandbox_cmd()
+        .args(["mount", local.to_str().unwrap(), "/data"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["attach", mountpoint.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let child = std::thread::spawn({
+        let path = mountpoint.join("data/file");
+        move || set_xattr(&path, "user.gated", b"value")
+    });
+    assert!(wait_until(Duration::from_secs(3), || {
+        session
+            .sandbox_cmd()
+            .arg("allow")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).contains("SETXATTR name=user.gated"))
+            .unwrap_or(false)
+    }));
+    let pending =
+        String::from_utf8(session.sandbox_cmd().arg("allow").output().unwrap().stdout).unwrap();
+    let id = pending.split_whitespace().next().unwrap().to_string();
+    assert!(get_xattr(&local.join("file"), "user.gated").is_err());
+    session
+        .sandbox_cmd()
+        .args(["allow", &id])
+        .assert()
+        .success();
+    child.join().unwrap().unwrap();
+    assert_eq!(
+        get_xattr(&local.join("file"), "user.gated").unwrap(),
+        b"value"
+    );
+
+    let log = session_log(&session);
+    assert_log_line_contains(
+        &log,
+        &[" pending ", "path=/data/file SETXATTR name=user.gated"],
+    );
+    assert_log_line_contains(&log, &["decision", &format!("request={id}"), "ALLOW"]);
 }
 
 #[test]

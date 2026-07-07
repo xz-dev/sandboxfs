@@ -196,6 +196,7 @@ pub enum PendingOperationKind {
     Gid,
     Flags,
     Times,
+    Xattr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -229,6 +230,14 @@ pub enum MetadataOperation {
         atime: Option<SystemTime>,
         mtime: Option<SystemTime>,
     },
+    SetXattr {
+        path: SandboxPath,
+        name: String,
+    },
+    RemoveXattr {
+        path: SandboxPath,
+        name: String,
+    },
 }
 
 impl MetadataOperation {
@@ -237,7 +246,9 @@ impl MetadataOperation {
             Self::Chmod { path, .. }
             | Self::Chown { path, .. }
             | Self::Chattr { path, .. }
-            | Self::SetAttr { path, .. } => path,
+            | Self::SetAttr { path, .. }
+            | Self::SetXattr { path, .. }
+            | Self::RemoveXattr { path, .. } => path,
         }
     }
 
@@ -252,6 +263,8 @@ impl MetadataOperation {
                 format_setattr_body(path, None, *uid, *gid, None, None, None)
             }
             Self::Chattr { path, flags } => format!("path={path} CHATTR flags=0x{flags:x}"),
+            Self::SetXattr { path, name } => format!("path={path} SETXATTR name={name}"),
+            Self::RemoveXattr { path, name } => format!("path={path} REMOVEXATTR name={name}"),
             Self::SetAttr {
                 path,
                 mode,
@@ -277,6 +290,9 @@ impl MetadataOperation {
                 }
             }
             Self::Chattr { .. } => kinds.push(PendingOperationKind::Flags),
+            Self::SetXattr { .. } | Self::RemoveXattr { .. } => {
+                kinds.push(PendingOperationKind::Xattr);
+            }
             Self::SetAttr {
                 mode,
                 uid,
@@ -322,6 +338,8 @@ impl MetadataOperation {
             Self::Chmod { path, mode } => format!("chmod {:o} {}", mode, path),
             Self::Chown { path, uid, gid } => format_chown_shell_hint(path, *uid, *gid),
             Self::Chattr { path, flags } => format!("chattr flags=0x{flags:x} {path}"),
+            Self::SetXattr { path, name } => format!("setfattr -n {name} {path}"),
+            Self::RemoveXattr { path, name } => format!("setfattr -x {name} {path}"),
             Self::SetAttr {
                 path,
                 mode,
@@ -952,6 +970,7 @@ impl Sandbox {
                 }
             }
             MetadataOperation::Chattr { flags, .. } => entry.flags = Some(*flags),
+            MetadataOperation::SetXattr { .. } | MetadataOperation::RemoveXattr { .. } => {}
             MetadataOperation::SetAttr {
                 mode,
                 uid,
