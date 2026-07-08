@@ -3,6 +3,7 @@ mod common;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime};
@@ -242,7 +243,7 @@ fn attach_and_detach_log_lifecycle_events() {
 
 #[test]
 #[ignore]
-fn attach_xattr_passthrough() {
+fn attach_xattr_bypass() {
     require_fuse();
     if !fuse_enabled() {
         return;
@@ -262,7 +263,7 @@ fn attach_xattr_passthrough() {
         .success();
     session
         .sandbox_cmd()
-        .args(["passthrough-metadata", "/data/**"])
+        .args(["bypass-metadata", "/data/**"])
         .assert()
         .success();
     session
@@ -301,7 +302,7 @@ fn attach_xattr_passthrough() {
 
 #[test]
 #[ignore]
-fn attach_xattr_passthrough_does_not_follow_symlink_inode() {
+fn attach_xattr_bypass_does_not_follow_symlink_inode() {
     require_fuse();
     if !fuse_enabled() {
         return;
@@ -394,7 +395,7 @@ fn protected_xattr_write_is_metadata_gated() {
 
 #[test]
 #[ignore]
-fn attach_readlink_passthrough() {
+fn attach_readlink_bypass() {
     require_fuse();
     if !fuse_enabled() {
         return;
@@ -981,12 +982,12 @@ fn stress_multiple_pending_viewers_do_not_consume_request() {
 
 #[test]
 #[ignore]
-fn passthrough_write_allows_mkdir_and_rmdir_without_enabling_file_writes() {
+fn bypass_write_allows_matching_write_effects_without_pending() {
     require_fuse();
     if !fuse_enabled() {
         return;
     }
-    let session = RunningSession::start("demo_fuse_passthrough_write_dirs");
+    let session = RunningSession::start("demo_fuse_bypass_write_effects");
     let local = session.temp.path().join("local");
     let mountpoint = session.temp.path().join("mnt");
     fs::create_dir_all(&local).unwrap();
@@ -999,7 +1000,12 @@ fn passthrough_write_allows_mkdir_and_rmdir_without_enabling_file_writes() {
         .success();
     session
         .sandbox_cmd()
-        .args(["passthrough-write", "/data/locks/"])
+        .args(["protect-write", "/data/**"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["bypass-write", "/data/**"])
         .assert()
         .success();
     session
@@ -1008,19 +1014,29 @@ fn passthrough_write_allows_mkdir_and_rmdir_without_enabling_file_writes() {
         .assert()
         .success();
 
-    fs::create_dir(mountpoint.join("data/locks")).unwrap();
-    assert!(local.join("locks").is_dir());
-    fs::remove_dir(mountpoint.join("data/locks")).unwrap();
-    assert!(!local.join("locks").exists());
-
-    let err = fs::write(mountpoint.join("data/file"), "blocked").unwrap_err();
-    assert_eq!(err.raw_os_error(), Some(libc::EROFS));
+    fs::write(mountpoint.join("data/file"), "created through bypass").unwrap();
+    assert_eq!(
+        fs::read_to_string(local.join("file")).unwrap(),
+        "created through bypass"
+    );
+    fs::write(mountpoint.join("data/file"), "updated through bypass").unwrap();
+    assert_eq!(
+        fs::read_to_string(local.join("file")).unwrap(),
+        "updated through bypass"
+    );
+    fs::remove_file(mountpoint.join("data/file")).unwrap();
     assert!(!local.join("file").exists());
+    session
+        .sandbox_cmd()
+        .arg("allow")
+        .assert()
+        .success()
+        .stdout(predicates::str::is_empty());
 }
 
 #[test]
 #[ignore]
-fn protected_symlink_write_intent_is_gated_without_host_mutation() {
+fn protected_symlink_write_allow_executes_host_mutation() {
     require_fuse();
     if !fuse_enabled() {
         return;
@@ -1068,8 +1084,11 @@ fn protected_symlink_write_intent_is_gated_without_host_mutation() {
         .args(["allow", &id])
         .assert()
         .success();
-    assert!(!wait_child(&mut child).success());
-    assert!(!local.join("link").exists());
+    assert!(wait_child(&mut child).success());
+    assert_eq!(
+        fs::read_link(local.join("link")).unwrap(),
+        Path::new("file")
+    );
 
     let log = session_log(&session);
     assert_log_line_contains(&log, &[" pending ", "path=/data/link WRITE symlink"]);
@@ -1078,12 +1097,80 @@ fn protected_symlink_write_intent_is_gated_without_host_mutation() {
 
 #[test]
 #[ignore]
-fn protected_hardlink_write_intent_is_gated_without_host_mutation() {
+fn metadata_protection_blocks_truncate_even_when_write_is_bypassed() {
     require_fuse();
     if !fuse_enabled() {
         return;
     }
-    let session = RunningSession::start("demo_fuse_hardlink_write");
+    let session = RunningSession::start("demo_fuse_truncate_metadata_precedence");
+    let local = session.temp.path().join("local");
+    let mountpoint = session.temp.path().join("mnt");
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&mountpoint).unwrap();
+    fs::write(local.join("file"), "hello world").unwrap();
+
+    session
+        .sandbox_cmd()
+        .args(["mount", local.to_str().unwrap(), "/data"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["protect-write", "/data/**"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["bypass-write", "/data/**"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["protect-metadata", "/data/**"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["attach", mountpoint.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let mut child = std::process::Command::new("truncate")
+        .args(["-s", "5", mountpoint.join("data/file").to_str().unwrap()])
+        .spawn()
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(3), || {
+        session
+            .sandbox_cmd()
+            .arg("allow")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).contains("METADATA truncate"))
+            .unwrap_or(false)
+    }));
+    assert_eq!(
+        fs::read_to_string(local.join("file")).unwrap(),
+        "hello world"
+    );
+    let pending =
+        String::from_utf8(session.sandbox_cmd().arg("allow").output().unwrap().stdout).unwrap();
+    let id = pending.split_whitespace().next().unwrap().to_string();
+    session
+        .sandbox_cmd()
+        .args(["allow", &id])
+        .assert()
+        .success();
+    assert!(wait_child(&mut child).success());
+    assert_eq!(fs::read_to_string(local.join("file")).unwrap(), "hello");
+}
+
+#[test]
+#[ignore]
+fn protected_hardlink_requires_source_metadata_and_destination_write_effects() {
+    require_fuse();
+    if !fuse_enabled() {
+        return;
+    }
+    let session = RunningSession::start("demo_fuse_hardlink_effects");
     let local = session.temp.path().join("local");
     let mountpoint = session.temp.path().join("mnt");
     fs::create_dir_all(&local).unwrap();
@@ -1097,7 +1184,12 @@ fn protected_hardlink_write_intent_is_gated_without_host_mutation() {
         .success();
     session
         .sandbox_cmd()
-        .args(["protect-write", "/data/**"])
+        .args(["protect-metadata", "/data/file"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["protect-write", "/data/hard"])
         .assert()
         .success();
     session
@@ -1118,26 +1210,30 @@ fn protected_hardlink_write_intent_is_gated_without_host_mutation() {
             .sandbox_cmd()
             .arg("allow")
             .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).contains("WRITE link"))
+            .map(|out| {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                stdout.contains("METADATA link") && stdout.contains("WRITE link")
+            })
             .unwrap_or(false)
     }));
     let pending =
         String::from_utf8(session.sandbox_cmd().arg("allow").output().unwrap().stdout).unwrap();
-    let id = pending.split_whitespace().next().unwrap().to_string();
-    session
-        .sandbox_cmd()
-        .args(["allow", &id])
-        .assert()
-        .success();
-    assert!(!wait_child(&mut child).success());
-    assert!(!local.join("hard").exists());
+    let ids = pending_ids(&pending);
+    assert_eq!(
+        ids.len(),
+        2,
+        "expected source metadata and destination write pending requests: {pending}"
+    );
+    for id in &ids {
+        session.sandbox_cmd().args(["allow", id]).assert().success();
+    }
+    assert!(wait_child(&mut child).success());
+    assert!(local.join("hard").exists());
+    assert_eq!(fs::metadata(local.join("file")).unwrap().nlink(), 2);
 
     let log = session_log(&session);
-    assert_log_line_contains(
-        &log,
-        &[" pending ", "path=/data/file WRITE link to=/data/hard"],
-    );
-    assert_log_line_contains(&log, &["decision", &format!("request={id}"), "ALLOW"]);
+    assert_log_line_contains(&log, &[" pending ", "path=/data/file METADATA link"]);
+    assert_log_line_contains(&log, &[" pending ", "path=/data/hard WRITE link"]);
 }
 
 #[test]

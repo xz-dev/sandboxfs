@@ -164,88 +164,82 @@ fn protection_rule_commands_log_outcomes_and_list_sorted_filters_without_logging
 }
 
 #[test]
-fn passthrough_rule_commands_log_outcomes_and_list_sorted_filters_without_logging() {
-    let session = RunningSession::start("demo_cli_passthrough");
+fn bypass_rule_commands_log_outcomes_and_list_sorted_filters_without_logging() {
+    let session = RunningSession::start("demo_cli_bypass");
 
     session
         .sandbox_cmd()
-        .args(["passthrough-write", "/b"])
+        .args(["bypass-write", "/b"])
         .assert()
         .success();
     session
         .sandbox_cmd()
-        .args(["passthrough-read", "/a"])
+        .args(["bypass-read", "/a"])
         .assert()
         .success();
     session
         .sandbox_cmd()
-        .args(["passthrough-write", "/a"])
+        .args(["bypass-write", "/a"])
         .assert()
         .success();
     session
         .sandbox_cmd()
-        .args(["passthrough-metadata", "/m/"])
+        .args(["bypass-metadata", "/m/"])
         .assert()
         .success();
     session
         .sandbox_cmd()
-        .args(["passthrough-read", "/a"])
+        .args(["bypass-read", "/a"])
         .assert()
         .success();
     session
         .sandbox_cmd()
-        .args(["unpassthrough-read", "/missing"])
+        .args(["unbypass-read", "/missing"])
         .assert()
         .success();
 
     session
         .sandbox_cmd()
-        .arg("list-passthrough")
+        .arg("list-bypass")
         .assert()
         .success()
         .stdout("READ /a\nWRITE /a\nWRITE /b\nMETADATA /m/\n");
     session
         .sandbox_cmd()
-        .args(["list-passthrough", "--read"])
+        .args(["list-bypass", "--read"])
         .assert()
         .success()
         .stdout("READ /a\n");
     session
         .sandbox_cmd()
-        .args(["list-passthrough", "--write"])
+        .args(["list-bypass", "--write"])
         .assert()
         .success()
         .stdout("WRITE /a\nWRITE /b\n");
     session
         .sandbox_cmd()
-        .args(["list-passthrough", "--metadata"])
+        .args(["list-bypass", "--metadata"])
         .assert()
         .success()
         .stdout("METADATA /m/\n");
     session
         .sandbox_cmd()
-        .args(["list-passthrough", "--read", "--write"])
+        .args(["list-bypass", "--read", "--write"])
         .assert()
         .success()
         .stdout("READ /a\nWRITE /a\nWRITE /b\n");
 
     let log_path = session.log_dir().join(format!("{}.log", session.name));
     let log_before_list = fs::read_to_string(&log_path).unwrap();
-    session
-        .sandbox_cmd()
-        .arg("list-passthrough")
-        .assert()
-        .success();
+    session.sandbox_cmd().arg("list-bypass").assert().success();
     assert_eq!(fs::read_to_string(&log_path).unwrap(), log_before_list);
 
-    assert!(log_before_list.contains("passthrough kind=WRITE pattern=/b result=added"));
-    assert!(log_before_list.contains("passthrough kind=READ pattern=/a result=added"));
-    assert!(log_before_list.contains("passthrough kind=WRITE pattern=/a result=added"));
-    assert!(log_before_list.contains("passthrough kind=METADATA pattern=/m/ result=added"));
-    assert!(log_before_list.contains("passthrough kind=READ pattern=/a result=already-present"));
-    assert!(
-        log_before_list.contains("unpassthrough kind=READ pattern=/missing result=not-present")
-    );
+    assert!(log_before_list.contains("bypass kind=WRITE pattern=/b result=added"));
+    assert!(log_before_list.contains("bypass kind=READ pattern=/a result=added"));
+    assert!(log_before_list.contains("bypass kind=WRITE pattern=/a result=added"));
+    assert!(log_before_list.contains("bypass kind=METADATA pattern=/m/ result=added"));
+    assert!(log_before_list.contains("bypass kind=READ pattern=/a result=already-present"));
+    assert!(log_before_list.contains("unbypass kind=READ pattern=/missing result=not-present"));
 }
 
 #[test]
