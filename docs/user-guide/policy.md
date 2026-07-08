@@ -66,6 +66,27 @@ This matters because a single FUSE operation can have multiple effects. For exam
 
 Hard link is another multi-effect operation: the source path has a `METADATA` effect because the source inode's link count and ctime change, while the destination path has a `WRITE` effect because a new directory entry is created.
 
+## Common operation effects
+
+This table describes the user-visible policy model for common FUSE operations. It is not a kernel trace of every incidental timestamp or ctime update; sandboxfs evaluates the explicit effects it exposes for protection and bypass decisions.
+
+| Operation | Effect path(s) | Policy effect(s) |
+| --- | --- | --- |
+| Read regular file contents | File path | `READ` |
+| List directory contents | Directory path | `READ` |
+| Read symlink target | Symlink path | `READ` |
+| Open for write, write, create file, create exclusive, `mknod`, `mkdir`, `symlink`, `unlink`, `rmdir` | Target path being opened, created, or removed | `WRITE` |
+| Truncate or set file size | Target path | `WRITE` and `METADATA` |
+| Rename | Source path and destination path | `WRITE` on each affected path |
+| Hard link | Existing source path and new destination path | `METADATA` on the source path; `WRITE` on the destination path |
+| `chmod`, `chown`, `chattr`, timestamp updates, inode-flag ioctls | Target path | `METADATA` |
+| `setxattr`, `removexattr` | Target path | `METADATA`; allowed xattr mutations are forwarded to the backing filesystem |
+| `getxattr`, `listxattr`, `lookup`, `getattr`, opening a read handle, opening a directory handle | Target path | No protected effect by default |
+
+Directory-entry operations use the entry path as the write effect path. For example, creating `/data/new` is a `WRITE` effect on `/data/new`, not a recursive write effect on `/data` or `/`. This keeps protection scoped to the path pattern the operator configured. If every create/delete also became a write on all ancestor directories, broad parent patterns would collapse most useful policy toward the root of the visible tree and make narrow protection rules much harder to reason about.
+
+Operations that mutate directory entries still may change backing filesystem metadata such as directory timestamps or inode ctime. Those incidental backing updates do not turn the operation into a recursive ancestor `METADATA` policy effect. Explicit metadata operations remain separately gated by `protect-metadata`, and coupled operations listed above, such as truncate or hard link, model the explicit metadata effects that matter for policy decisions.
+
 ## Grants
 
 For protected read/write requests, bare `allow <operation_id>` only releases the current blocked request.
