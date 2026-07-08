@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 use crate::path::SandboxPath;
 use crate::state::{
-    PassthroughRule, PendingRequest, PolicyPattern, ProtectionKind, ProtectionRule,
+    BypassRule, PendingRequest, PolicyPattern, ProtectionKind, ProtectionRule,
     ReadWriteGrantOptions, TrustedPathScope,
 };
 
@@ -52,12 +52,12 @@ pub enum Request {
         kind: ProtectionKind,
         pattern: PolicyPattern,
     },
-    Passthrough {
+    Bypass {
         name: String,
         kind: ProtectionKind,
         pattern: PolicyPattern,
     },
-    Unpassthrough {
+    Unbypass {
         name: String,
         kind: ProtectionKind,
         pattern: PolicyPattern,
@@ -68,7 +68,7 @@ pub enum Request {
         include_write: bool,
         include_metadata: bool,
     },
-    ListPassthrough {
+    ListBypass {
         name: String,
         include_read: bool,
         include_write: bool,
@@ -137,8 +137,8 @@ pub enum Response {
     ProtectionRules {
         items: Vec<ProtectionRule>,
     },
-    PassthroughRules {
-        items: Vec<PassthroughRule>,
+    BypassRules {
+        items: Vec<BypassRule>,
     },
     Trusted {
         token: String,

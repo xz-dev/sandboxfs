@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::SystemTime;
@@ -66,6 +66,7 @@ pub struct SandboxFs {
 struct HandleInfo {
     local_path: PathBuf,
     sandbox_path: SandboxPath,
+    writable: bool,
 }
 
 struct PendingMetadataOutcome {
@@ -208,7 +209,7 @@ impl SandboxFs {
         Ok(sandbox.path_is_directory(path))
     }
 
-    fn path_matches_passthrough(
+    fn path_matches_bypass(
         &self,
         kind: ProtectionKind,
         path: &SandboxPath,
@@ -219,7 +220,7 @@ impl SandboxFs {
             .sandboxes
             .get(&self.sandbox_name)
             .ok_or(Errno::ENOENT)?;
-        Ok(sandbox.is_passthrough(kind, path, target_is_dir))
+        Ok(sandbox.is_bypass(kind, path, target_is_dir))
     }
 
     fn is_trusted_operation(
@@ -437,25 +438,9 @@ impl SandboxFs {
         identity: RequestIdentity,
         operation: ReadWriteOperation,
     ) -> std::result::Result<ReadWriteDecision, Errno> {
-        let kind = operation.kind();
-        let description = operation.event_body();
         let mut registry = self.registry.lock().unwrap();
         let Some(sandbox) = registry.sandboxes.get(&self.sandbox_name) else {
             return Err(Errno::ENOENT);
-        };
-        let protection_paths = operation.protection_paths();
-        if protection_paths
-            .iter()
-            .all(|path| sandbox.is_passthrough(kind, path, sandbox.path_is_directory(path)))
-        {
-            return Ok(ReadWriteDecision::Proceed);
-        }
-        let Some(protected_path) = protection_paths
-            .into_iter()
-            .find(|path| sandbox.is_protected(kind, path, sandbox.path_is_directory(path)))
-            .cloned()
-        else {
-            return Ok(ReadWriteDecision::Proceed);
         };
         let log_path = sandbox.log_path.clone();
         let process_identity = SysinfoProcessInfoProvider.identity_for_pid(identity.pid);
@@ -465,38 +450,66 @@ impl SandboxFs {
             .into_iter()
             .map(|grant| (registry.next_operation_id(), grant.id))
             .collect();
-        match registry.match_read_write_grant_for_intent(
-            &self.sandbox_name,
-            kind,
-            &protected_path,
-            process_identity,
-            now,
-        ) {
-            GrantMatchOutcome::Matched { grant_id, consumed } => {
-                let consumed_event_id = consumed.then(|| registry.next_operation_id());
-                drop(registry);
-                for (event_id, grant_id) in expired_events {
-                    let _ = self.log_writer.append(
-                        &log_path,
-                        log::format_log_line(
-                            event_id,
-                            &format!("grant-expired grant={grant_id} lifetime=duration"),
-                        ),
-                    );
-                }
-                if let Some(event_id) = consumed_event_id {
-                    let _ = self.log_writer.append(
-                        &log_path,
-                        log::format_log_line(
-                            event_id,
-                            &format!("grant-consumed grant={grant_id} lifetime=one-shot"),
-                        ),
-                    );
-                }
-                return Ok(ReadWriteDecision::Proceed);
+        let mut consumed_events = Vec::new();
+        let mut waiters = Vec::new();
+
+        for effect in operation.effects() {
+            let Some(sandbox) = registry.sandboxes.get(&self.sandbox_name) else {
+                return Err(Errno::ENOENT);
+            };
+            let target_is_dir = sandbox.path_is_directory(&effect.path);
+            if sandbox.is_bypass(effect.kind, &effect.path, target_is_dir)
+                || !sandbox.is_protected(effect.kind, &effect.path, target_is_dir)
+            {
+                continue;
             }
-            GrantMatchOutcome::NotMatched => {}
+            match registry.match_read_write_grant_for_intent(
+                &self.sandbox_name,
+                effect.kind,
+                &effect.path,
+                process_identity,
+                now,
+            ) {
+                GrantMatchOutcome::Matched { grant_id, consumed } => {
+                    if consumed {
+                        consumed_events.push((registry.next_operation_id(), grant_id));
+                    }
+                    continue;
+                }
+                GrantMatchOutcome::NotMatched => {}
+            }
+
+            let waiter: PendingWaiter = Arc::new((Mutex::new(None), Condvar::new()));
+            let id = registry.next_operation_id();
+            self.log_writer
+                .append(
+                    &log_path,
+                    log::format_log_line(
+                        id,
+                        &format!(
+                            "pending{} {}",
+                            format_attach_field(self.attach_id),
+                            effect.description
+                        ),
+                    ),
+                )
+                .map_err(|_| Errno::EIO)?;
+            registry.insert_pending_read_write_request(
+                PendingReadWriteRequest::new_with_attach_effect(
+                    id,
+                    self.sandbox_name.clone(),
+                    self.attach_id,
+                    operation.clone(),
+                    effect,
+                    identity,
+                )
+                .with_process_identity(process_identity),
+            );
+            registry.pending_waiters.insert(id, Arc::clone(&waiter));
+            waiters.push(waiter);
         }
+        drop(registry);
+
         for (event_id, grant_id) in expired_events {
             let _ = self.log_writer.append(
                 &log_path,
@@ -506,39 +519,24 @@ impl SandboxFs {
                 ),
             );
         }
-        let waiter: PendingWaiter = Arc::new((Mutex::new(None), Condvar::new()));
-        let id = registry.next_operation_id();
-        self.log_writer
-            .append(
+        for (event_id, grant_id) in consumed_events {
+            let _ = self.log_writer.append(
                 &log_path,
                 log::format_log_line(
-                    id,
-                    &format!(
-                        "pending{} {description}",
-                        format_attach_field(self.attach_id)
-                    ),
+                    event_id,
+                    &format!("grant-consumed grant={grant_id} lifetime=one-shot"),
                 ),
-            )
-            .map_err(|_| Errno::EIO)?;
-        registry.insert_pending_read_write_request(
-            PendingReadWriteRequest::new_with_attach_path(
-                id,
-                self.sandbox_name.clone(),
-                self.attach_id,
-                operation,
-                protected_path,
-                identity,
-            )
-            .with_process_identity(process_identity),
-        );
-        registry.pending_waiters.insert(id, Arc::clone(&waiter));
-        drop(registry);
-
-        match wait_for_decision(&waiter) {
-            PendingDecision::Apply | PendingDecision::DoNothing => Ok(ReadWriteDecision::Proceed),
-            PendingDecision::Deny => Ok(ReadWriteDecision::Denied),
-            PendingDecision::Cancel => Ok(ReadWriteDecision::Canceled),
+            );
         }
+
+        for waiter in waiters {
+            match wait_for_decision(&waiter) {
+                PendingDecision::Apply | PendingDecision::DoNothing => {}
+                PendingDecision::Deny => return Ok(ReadWriteDecision::Denied),
+                PendingDecision::Cancel => return Ok(ReadWriteDecision::Canceled),
+            }
+        }
+        Ok(ReadWriteDecision::Proceed)
     }
 
     fn finish_pending_attr(
@@ -839,17 +837,26 @@ impl Filesystem for SandboxFs {
             reply.error(Errno::ENOENT);
             return;
         };
-        if flags.acc_mode() != OpenAccMode::O_RDONLY {
+        let writable = flags.acc_mode() != OpenAccMode::O_RDONLY;
+        if writable {
             match self.authorize_read_write(
                 RequestIdentity::from_request(req),
-                ReadWriteOperation::OpenWrite { path },
+                ReadWriteOperation::OpenWrite { path: path.clone() },
             ) {
-                Ok(ReadWriteDecision::Proceed) => reply.error(Errno::EROFS),
-                Ok(ReadWriteDecision::Denied) => reply.error(Errno::EACCES),
-                Ok(ReadWriteDecision::Canceled) => reply.error(Errno::ECANCELED),
-                Err(err) => reply.error(err),
+                Ok(ReadWriteDecision::Proceed) => {}
+                Ok(ReadWriteDecision::Denied) => {
+                    reply.error(Errno::EACCES);
+                    return;
+                }
+                Ok(ReadWriteDecision::Canceled) => {
+                    reply.error(Errno::ECANCELED);
+                    return;
+                }
+                Err(err) => {
+                    reply.error(err);
+                    return;
+                }
             }
-            return;
         }
         let registry = self.registry.lock().unwrap();
         let Some(sandbox) = registry.sandboxes.get(&self.sandbox_name) else {
@@ -866,6 +873,7 @@ impl Filesystem for SandboxFs {
                     HandleInfo {
                         local_path,
                         sandbox_path: path.clone(),
+                        writable,
                     },
                 );
                 reply.opened(FileHandle(fh), FopenFlags::empty());
@@ -984,7 +992,7 @@ impl Filesystem for SandboxFs {
         atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -995,15 +1003,39 @@ impl Filesystem for SandboxFs {
             reply.error(Errno::ENOENT);
             return;
         };
-        if size.is_some() {
+        if let Some(size) = size {
             match self.authorize_read_write(
                 RequestIdentity::from_request(req),
-                ReadWriteOperation::Truncate { path },
+                ReadWriteOperation::Truncate { path: path.clone() },
             ) {
-                Ok(ReadWriteDecision::Proceed) => reply.error(Errno::EROFS),
-                Ok(ReadWriteDecision::Denied) => reply.error(Errno::EACCES),
-                Ok(ReadWriteDecision::Canceled) => reply.error(Errno::ECANCELED),
-                Err(err) => reply.error(err),
+                Ok(ReadWriteDecision::Proceed) => {}
+                Ok(ReadWriteDecision::Denied) => {
+                    reply.error(Errno::EACCES);
+                    return;
+                }
+                Ok(ReadWriteDecision::Canceled) => {
+                    reply.error(Errno::ECANCELED);
+                    return;
+                }
+                Err(err) => {
+                    reply.error(err);
+                    return;
+                }
+            }
+            let local_path = fh
+                .and_then(|fh| self.handles.lock().unwrap().get(&fh.0).cloned())
+                .map(|handle| handle.local_path)
+                .or_else(|| self.local_path_for_ino(ino));
+            let Some(local_path) = local_path else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            match hostfs::truncate(&local_path, size).and_then(|()| real_attr(&path, &local_path)) {
+                Ok(mut attr) => {
+                    attr.ino = self.remember(&path);
+                    reply.attr(&TTL, &attr);
+                }
+                Err(err) => reply.error(io_to_errno(err)),
             }
             return;
         }
@@ -1016,7 +1048,7 @@ impl Filesystem for SandboxFs {
             && gid.is_none()
             && flags.is_none()
             && self
-                .path_matches_passthrough(ProtectionKind::Metadata, &path, target_is_dir)
+                .path_matches_bypass(ProtectionKind::Metadata, &path, target_is_dir)
                 .unwrap_or(false)
         {
             let Some(local_path) = self.local_path_for_ino(ino) else {
@@ -1147,7 +1179,7 @@ impl Filesystem for SandboxFs {
             name: name.to_string_lossy().into_owned(),
         };
         if self
-            .path_matches_passthrough(
+            .path_matches_bypass(
                 ProtectionKind::Metadata,
                 &path,
                 self.path_is_directory(&path).unwrap_or(false),
@@ -1205,7 +1237,7 @@ impl Filesystem for SandboxFs {
             name: name.to_string_lossy().into_owned(),
         };
         if self
-            .path_matches_passthrough(
+            .path_matches_bypass(
                 ProtectionKind::Metadata,
                 &path,
                 self.path_is_directory(&path).unwrap_or(false),
@@ -1232,8 +1264,8 @@ impl Filesystem for SandboxFs {
         req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
-        _offset: u64,
-        _data: &[u8],
+        offset: u64,
+        data: &[u8],
         _write_flags: fuser::WriteFlags,
         _flags: OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
@@ -1243,16 +1275,39 @@ impl Filesystem for SandboxFs {
             reply.error(Errno::EBADF);
             return;
         };
+        if !handle.writable {
+            reply.error(Errno::EBADF);
+            return;
+        }
         match self.authorize_read_write(
             RequestIdentity::from_request(req),
             ReadWriteOperation::WriteFile {
                 path: handle.sandbox_path,
             },
         ) {
-            Ok(ReadWriteDecision::Proceed) => reply.error(Errno::EROFS),
-            Ok(ReadWriteDecision::Denied) => reply.error(Errno::EACCES),
-            Ok(ReadWriteDecision::Canceled) => reply.error(Errno::ECANCELED),
-            Err(err) => reply.error(err),
+            Ok(ReadWriteDecision::Proceed) => {}
+            Ok(ReadWriteDecision::Denied) => {
+                reply.error(Errno::EACCES);
+                return;
+            }
+            Ok(ReadWriteDecision::Canceled) => {
+                reply.error(Errno::ECANCELED);
+                return;
+            }
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        }
+        match OpenOptions::new()
+            .write(true)
+            .open(&handle.local_path)
+            .and_then(|mut file| {
+                file.seek(SeekFrom::Start(offset))?;
+                file.write(data)
+            }) {
+            Ok(written) => reply.written(written as u32),
+            Err(err) => reply.error(io_to_errno(err)),
         }
     }
 
@@ -1261,9 +1316,9 @@ impl Filesystem for SandboxFs {
         req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         let Ok(path) = self.path_child(parent, name) else {
@@ -1272,12 +1327,61 @@ impl Filesystem for SandboxFs {
         };
         match self.authorize_read_write(
             RequestIdentity::from_request(req),
-            ReadWriteOperation::Create { path },
+            ReadWriteOperation::Create { path: path.clone() },
         ) {
-            Ok(ReadWriteDecision::Proceed) => reply.error(Errno::EROFS),
-            Ok(ReadWriteDecision::Denied) => reply.error(Errno::EACCES),
-            Ok(ReadWriteDecision::Canceled) => reply.error(Errno::ECANCELED),
-            Err(err) => reply.error(err),
+            Ok(ReadWriteDecision::Proceed) => {}
+            Ok(ReadWriteDecision::Denied) => {
+                reply.error(Errno::EACCES);
+                return;
+            }
+            Ok(ReadWriteDecision::Canceled) => {
+                reply.error(Errno::ECANCELED);
+                return;
+            }
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        }
+        let local_path = match self.local_path_for_child(parent, name) {
+            Ok(local_path) => local_path,
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+        match OpenOptions::new()
+            .create(true)
+            .truncate(flags & libc::O_TRUNC != 0)
+            .append(flags & libc::O_APPEND != 0)
+            .write(true)
+            .read(flags & libc::O_ACCMODE == libc::O_RDWR)
+            .mode(mode & 0o7777)
+            .open(&local_path)
+            .and_then(|_| real_attr(&path, &local_path))
+        {
+            Ok(mut attr) => {
+                attr.ino = self.remember(&path);
+                let mut next = self.next_handle.lock().unwrap();
+                let fh = *next;
+                *next += 1;
+                self.handles.lock().unwrap().insert(
+                    fh,
+                    HandleInfo {
+                        local_path,
+                        sandbox_path: path,
+                        writable: true,
+                    },
+                );
+                reply.created(
+                    &TTL,
+                    &attr,
+                    Generation(0),
+                    FileHandle(fh),
+                    FopenFlags::empty(),
+                );
+            }
+            Err(err) => reply.error(io_to_errno(err)),
         }
     }
 
@@ -1294,36 +1398,39 @@ impl Filesystem for SandboxFs {
             reply.error(Errno::ENOENT);
             return;
         };
-        if self
-            .path_matches_passthrough(ProtectionKind::Write, &path, true)
-            .unwrap_or(false)
-        {
-            let local_path = match self.local_path_for_child(parent, name) {
-                Ok(local_path) => local_path,
-                Err(err) => {
-                    reply.error(err);
-                    return;
-                }
-            };
-            match hostfs::mkdir(&local_path, _mode & 0o7777)
-                .and_then(|()| real_attr(&path, &local_path))
-            {
-                Ok(mut attr) => {
-                    attr.ino = self.remember(&path);
-                    reply.entry(&TTL, &attr, Generation(0));
-                }
-                Err(err) => reply.error(io_to_errno(err)),
-            }
-            return;
-        }
         match self.authorize_read_write(
             RequestIdentity::from_request(req),
-            ReadWriteOperation::Mkdir { path },
+            ReadWriteOperation::Mkdir { path: path.clone() },
         ) {
-            Ok(ReadWriteDecision::Proceed) => reply.error(Errno::EROFS),
-            Ok(ReadWriteDecision::Denied) => reply.error(Errno::EACCES),
-            Ok(ReadWriteDecision::Canceled) => reply.error(Errno::ECANCELED),
-            Err(err) => reply.error(err),
+            Ok(ReadWriteDecision::Proceed) => {}
+            Ok(ReadWriteDecision::Denied) => {
+                reply.error(Errno::EACCES);
+                return;
+            }
+            Ok(ReadWriteDecision::Canceled) => {
+                reply.error(Errno::ECANCELED);
+                return;
+            }
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        }
+        let local_path = match self.local_path_for_child(parent, name) {
+            Ok(local_path) => local_path,
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+        match hostfs::mkdir(&local_path, _mode & 0o7777)
+            .and_then(|()| real_attr(&path, &local_path))
+        {
+            Ok(mut attr) => {
+                attr.ino = self.remember(&path);
+                reply.entry(&TTL, &attr, Generation(0));
+            }
+            Err(err) => reply.error(io_to_errno(err)),
         }
     }
 
@@ -1366,12 +1473,35 @@ impl Filesystem for SandboxFs {
         };
         match self.authorize_read_write(
             RequestIdentity::from_request(req),
-            ReadWriteOperation::Symlink { path },
+            ReadWriteOperation::Symlink { path: path.clone() },
         ) {
-            Ok(ReadWriteDecision::Proceed) => reply.error(Errno::EROFS),
-            Ok(ReadWriteDecision::Denied) => reply.error(Errno::EACCES),
-            Ok(ReadWriteDecision::Canceled) => reply.error(Errno::ECANCELED),
-            Err(err) => reply.error(err),
+            Ok(ReadWriteDecision::Proceed) => {}
+            Ok(ReadWriteDecision::Denied) => {
+                reply.error(Errno::EACCES);
+                return;
+            }
+            Ok(ReadWriteDecision::Canceled) => {
+                reply.error(Errno::ECANCELED);
+                return;
+            }
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        }
+        let local_path = match self.local_path_for_child(parent, link_name) {
+            Ok(local_path) => local_path,
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+        match hostfs::symlink(_target, &local_path).and_then(|()| real_attr(&path, &local_path)) {
+            Ok(mut attr) => {
+                attr.ino = self.remember(&path);
+                reply.entry(&TTL, &attr, Generation(0));
+            }
+            Err(err) => reply.error(io_to_errno(err)),
         }
     }
 
@@ -1393,12 +1523,42 @@ impl Filesystem for SandboxFs {
         };
         match self.authorize_read_write(
             RequestIdentity::from_request(req),
-            ReadWriteOperation::Link { from, to },
+            ReadWriteOperation::Link {
+                from: from.clone(),
+                to: to.clone(),
+            },
         ) {
-            Ok(ReadWriteDecision::Proceed) => reply.error(Errno::EROFS),
-            Ok(ReadWriteDecision::Denied) => reply.error(Errno::EACCES),
-            Ok(ReadWriteDecision::Canceled) => reply.error(Errno::ECANCELED),
-            Err(err) => reply.error(err),
+            Ok(ReadWriteDecision::Proceed) => {}
+            Ok(ReadWriteDecision::Denied) => {
+                reply.error(Errno::EACCES);
+                return;
+            }
+            Ok(ReadWriteDecision::Canceled) => {
+                reply.error(Errno::ECANCELED);
+                return;
+            }
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        }
+        let Some(from_local) = self.local_path_for_ino(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let to_local = match self.local_path_for_child(newparent, newname) {
+            Ok(local_path) => local_path,
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+        match hostfs::hard_link(&from_local, &to_local).and_then(|()| real_attr(&to, &to_local)) {
+            Ok(mut attr) => {
+                attr.ino = self.remember(&to);
+                reply.entry(&TTL, &attr, Generation(0));
+            }
+            Err(err) => reply.error(io_to_errno(err)),
         }
     }
 
@@ -1409,12 +1569,32 @@ impl Filesystem for SandboxFs {
         };
         match self.authorize_read_write(
             RequestIdentity::from_request(req),
-            ReadWriteOperation::Unlink { path },
+            ReadWriteOperation::Unlink { path: path.clone() },
         ) {
-            Ok(ReadWriteDecision::Proceed) => reply.error(Errno::EROFS),
-            Ok(ReadWriteDecision::Denied) => reply.error(Errno::EACCES),
-            Ok(ReadWriteDecision::Canceled) => reply.error(Errno::ECANCELED),
-            Err(err) => reply.error(err),
+            Ok(ReadWriteDecision::Proceed) => {}
+            Ok(ReadWriteDecision::Denied) => {
+                reply.error(Errno::EACCES);
+                return;
+            }
+            Ok(ReadWriteDecision::Canceled) => {
+                reply.error(Errno::ECANCELED);
+                return;
+            }
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        }
+        let local_path = match self.local_path_for_child(parent, name) {
+            Ok(local_path) => local_path,
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+        match hostfs::unlink(&local_path) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(io_to_errno(err)),
         }
     }
 
@@ -1423,31 +1603,34 @@ impl Filesystem for SandboxFs {
             reply.error(Errno::ENOENT);
             return;
         };
-        if self
-            .path_matches_passthrough(ProtectionKind::Write, &path, true)
-            .unwrap_or(false)
-        {
-            let local_path = match self.local_path_for_child(parent, name) {
-                Ok(local_path) => local_path,
-                Err(err) => {
-                    reply.error(err);
-                    return;
-                }
-            };
-            match hostfs::rmdir(&local_path) {
-                Ok(()) => reply.ok(),
-                Err(err) => reply.error(io_to_errno(err)),
-            }
-            return;
-        }
         match self.authorize_read_write(
             RequestIdentity::from_request(req),
-            ReadWriteOperation::Rmdir { path },
+            ReadWriteOperation::Rmdir { path: path.clone() },
         ) {
-            Ok(ReadWriteDecision::Proceed) => reply.error(Errno::EROFS),
-            Ok(ReadWriteDecision::Denied) => reply.error(Errno::EACCES),
-            Ok(ReadWriteDecision::Canceled) => reply.error(Errno::ECANCELED),
-            Err(err) => reply.error(err),
+            Ok(ReadWriteDecision::Proceed) => {}
+            Ok(ReadWriteDecision::Denied) => {
+                reply.error(Errno::EACCES);
+                return;
+            }
+            Ok(ReadWriteDecision::Canceled) => {
+                reply.error(Errno::ECANCELED);
+                return;
+            }
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        }
+        let local_path = match self.local_path_for_child(parent, name) {
+            Ok(local_path) => local_path,
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+        match hostfs::rmdir(&local_path) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(io_to_errno(err)),
         }
     }
 
@@ -1471,12 +1654,42 @@ impl Filesystem for SandboxFs {
         };
         match self.authorize_read_write(
             RequestIdentity::from_request(req),
-            ReadWriteOperation::Rename { from, to },
+            ReadWriteOperation::Rename {
+                from: from.clone(),
+                to: to.clone(),
+            },
         ) {
-            Ok(ReadWriteDecision::Proceed) => reply.error(Errno::EROFS),
-            Ok(ReadWriteDecision::Denied) => reply.error(Errno::EACCES),
-            Ok(ReadWriteDecision::Canceled) => reply.error(Errno::ECANCELED),
-            Err(err) => reply.error(err),
+            Ok(ReadWriteDecision::Proceed) => {}
+            Ok(ReadWriteDecision::Denied) => {
+                reply.error(Errno::EACCES);
+                return;
+            }
+            Ok(ReadWriteDecision::Canceled) => {
+                reply.error(Errno::ECANCELED);
+                return;
+            }
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        }
+        let from_local = match self.local_path_for_child(parent, name) {
+            Ok(local_path) => local_path,
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+        let to_local = match self.local_path_for_child(newparent, newname) {
+            Ok(local_path) => local_path,
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+        match hostfs::rename(&from_local, &to_local) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(io_to_errno(err)),
         }
     }
 }
@@ -2092,7 +2305,7 @@ mod tests {
             assert_eq!(pending.path, SandboxPath::new("/data/new-link").unwrap());
             assert_eq!(
                 pending.description,
-                "path=/data/file WRITE link to=/data/new-link"
+                "path=/data/new-link WRITE link from=/data/file"
             );
         }
         resolve_pending_read_write(&registry, id, PendingDecision::Apply);
@@ -2142,7 +2355,7 @@ mod tests {
             assert_eq!(pending.path, SandboxPath::new("/data/new").unwrap());
             assert_eq!(
                 pending.description,
-                "path=/data/old WRITE rename to=/data/new"
+                "path=/data/new WRITE rename from=/data/old"
             );
         }
         resolve_pending_read_write(&registry, id, PendingDecision::Apply);

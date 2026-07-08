@@ -58,6 +58,23 @@ impl std::fmt::Display for ProtectionKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ReadWriteEffect {
+    pub kind: ProtectionKind,
+    pub path: SandboxPath,
+    pub description: String,
+}
+
+impl ReadWriteEffect {
+    pub fn new(kind: ProtectionKind, path: SandboxPath, description: String) -> Self {
+        Self {
+            kind,
+            path,
+            description,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct PolicyPattern {
     raw: String,
@@ -160,12 +177,12 @@ impl ProtectionRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PassthroughRule {
+pub struct BypassRule {
     pub kind: ProtectionKind,
     pub pattern: PolicyPattern,
 }
 
-impl PassthroughRule {
+impl BypassRule {
     pub fn matches(&self, path: &SandboxPath, target_is_dir: bool) -> bool {
         self.pattern.matches(path, target_is_dir)
     }
@@ -210,19 +227,100 @@ pub enum ReadWriteOperation {
 
 impl ReadWriteOperation {
     pub fn kind(&self) -> ProtectionKind {
+        self.effects()
+            .first()
+            .map(|effect| effect.kind)
+            .unwrap_or(ProtectionKind::Write)
+    }
+
+    pub fn effects(&self) -> Vec<ReadWriteEffect> {
         match self {
-            Self::ReadFile { .. } | Self::ReadDirectory { .. } => ProtectionKind::Read,
-            Self::OpenWrite { .. }
-            | Self::WriteFile { .. }
-            | Self::Truncate { .. }
-            | Self::Create { .. }
-            | Self::Mkdir { .. }
-            | Self::Mknod { .. }
-            | Self::Symlink { .. }
-            | Self::Link { .. }
-            | Self::Unlink { .. }
-            | Self::Rmdir { .. }
-            | Self::Rename { .. } => ProtectionKind::Write,
+            Self::ReadFile { path } => vec![ReadWriteEffect::new(
+                ProtectionKind::Read,
+                path.clone(),
+                format!("path={path} READ file"),
+            )],
+            Self::ReadDirectory { path } => vec![ReadWriteEffect::new(
+                ProtectionKind::Read,
+                path.clone(),
+                format!("path={path} READ directory"),
+            )],
+            Self::OpenWrite { path } => vec![ReadWriteEffect::new(
+                ProtectionKind::Write,
+                path.clone(),
+                format!("path={path} WRITE open"),
+            )],
+            Self::WriteFile { path } => vec![ReadWriteEffect::new(
+                ProtectionKind::Write,
+                path.clone(),
+                format!("path={path} WRITE data"),
+            )],
+            Self::Truncate { path } => vec![
+                ReadWriteEffect::new(
+                    ProtectionKind::Write,
+                    path.clone(),
+                    format!("path={path} WRITE truncate"),
+                ),
+                ReadWriteEffect::new(
+                    ProtectionKind::Metadata,
+                    path.clone(),
+                    format!("path={path} METADATA truncate"),
+                ),
+            ],
+            Self::Create { path } => vec![ReadWriteEffect::new(
+                ProtectionKind::Write,
+                path.clone(),
+                format!("path={path} WRITE create"),
+            )],
+            Self::Mkdir { path } => vec![ReadWriteEffect::new(
+                ProtectionKind::Write,
+                path.clone(),
+                format!("path={path} WRITE mkdir"),
+            )],
+            Self::Mknod { path } => vec![ReadWriteEffect::new(
+                ProtectionKind::Write,
+                path.clone(),
+                format!("path={path} WRITE mknod"),
+            )],
+            Self::Symlink { path } => vec![ReadWriteEffect::new(
+                ProtectionKind::Write,
+                path.clone(),
+                format!("path={path} WRITE symlink"),
+            )],
+            Self::Link { from, to } => vec![
+                ReadWriteEffect::new(
+                    ProtectionKind::Metadata,
+                    from.clone(),
+                    format!("path={from} METADATA link to={to}"),
+                ),
+                ReadWriteEffect::new(
+                    ProtectionKind::Write,
+                    to.clone(),
+                    format!("path={to} WRITE link from={from}"),
+                ),
+            ],
+            Self::Unlink { path } => vec![ReadWriteEffect::new(
+                ProtectionKind::Write,
+                path.clone(),
+                format!("path={path} WRITE unlink"),
+            )],
+            Self::Rmdir { path } => vec![ReadWriteEffect::new(
+                ProtectionKind::Write,
+                path.clone(),
+                format!("path={path} WRITE rmdir"),
+            )],
+            Self::Rename { from, to } => vec![
+                ReadWriteEffect::new(
+                    ProtectionKind::Write,
+                    from.clone(),
+                    format!("path={from} WRITE rename to={to}"),
+                ),
+                ReadWriteEffect::new(
+                    ProtectionKind::Write,
+                    to.clone(),
+                    format!("path={to} WRITE rename from={from}"),
+                ),
+            ],
         }
     }
 
@@ -685,6 +783,29 @@ impl PendingReadWriteRequest {
         }
     }
 
+    pub fn new_with_attach_effect(
+        id: u64,
+        sandbox: String,
+        attach_id: Option<u64>,
+        operation: ReadWriteOperation,
+        effect: ReadWriteEffect,
+        requester: RequesterIdentity,
+    ) -> Self {
+        Self {
+            id,
+            sandbox,
+            attach_id,
+            kind: effect.kind,
+            path: effect.path,
+            description: effect.description,
+            operation,
+            pid: requester.pid,
+            uid: requester.uid,
+            gid: requester.gid,
+            process_identity: None,
+        }
+    }
+
     pub fn with_process_identity(mut self, identity: Option<ProcessIdentityEvidence>) -> Self {
         self.process_identity = identity;
         self
@@ -942,7 +1063,7 @@ pub struct Sandbox {
     pub hides: Vec<HideRule>,
     pub metadata: BTreeMap<MetadataObjectKey, MetadataEntry>,
     pub protection_rules: Vec<ProtectionRule>,
-    pub passthrough_rules: Vec<PassthroughRule>,
+    pub bypass_rules: Vec<BypassRule>,
     pub attaches: BTreeMap<PathBuf, AttachMount>,
     pub next_layer_id: u64,
     pub next_hide_id: u64,
@@ -957,7 +1078,7 @@ impl Sandbox {
             hides: Vec::new(),
             metadata: BTreeMap::new(),
             protection_rules: Vec::new(),
-            passthrough_rules: Vec::new(),
+            bypass_rules: Vec::new(),
             attaches: BTreeMap::new(),
             next_layer_id: 1,
             next_hide_id: 1,
@@ -1031,38 +1152,37 @@ impl Sandbox {
         ProtectionRuleResult::Removed
     }
 
-    pub fn add_passthrough(
+    pub fn add_bypass(
         &mut self,
         kind: ProtectionKind,
         pattern: impl Into<PolicyPattern>,
     ) -> ProtectionRuleResult {
         let pattern = pattern.into();
         if self
-            .passthrough_rules
+            .bypass_rules
             .iter()
             .any(|rule| rule.kind == kind && rule.pattern == pattern)
         {
             return ProtectionRuleResult::AlreadyPresent;
         }
-        self.passthrough_rules
-            .push(PassthroughRule { kind, pattern });
+        self.bypass_rules.push(BypassRule { kind, pattern });
         ProtectionRuleResult::Added
     }
 
-    pub fn remove_passthrough(
+    pub fn remove_bypass(
         &mut self,
         kind: ProtectionKind,
         pattern: impl Into<PolicyPattern>,
     ) -> ProtectionRuleResult {
         let pattern = pattern.into();
         let Some(index) = self
-            .passthrough_rules
+            .bypass_rules
             .iter()
             .position(|rule| rule.kind == kind && rule.pattern == pattern)
         else {
             return ProtectionRuleResult::NotPresent;
         };
-        self.passthrough_rules.remove(index);
+        self.bypass_rules.remove(index);
         ProtectionRuleResult::Removed
     }
 
@@ -1094,18 +1214,18 @@ impl Sandbox {
         rules
     }
 
-    pub fn passthrough_rules(
+    pub fn bypass_rules(
         &self,
         include_read: bool,
         include_write: bool,
         include_metadata: bool,
-    ) -> Vec<PassthroughRule> {
+    ) -> Vec<BypassRule> {
         let include_all = !include_read && !include_write && !include_metadata;
         let include_read = include_read || include_all;
         let include_write = include_write || include_all;
         let include_metadata = include_metadata || include_all;
-        let mut rules: Vec<PassthroughRule> = self
-            .passthrough_rules
+        let mut rules: Vec<BypassRule> = self
+            .bypass_rules
             .iter()
             .filter(|rule| match rule.kind {
                 ProtectionKind::Read => include_read,
@@ -1133,13 +1253,8 @@ impl Sandbox {
             .any(|rule| rule.kind == kind && rule.matches(path, target_is_dir))
     }
 
-    pub fn is_passthrough(
-        &self,
-        kind: ProtectionKind,
-        path: &SandboxPath,
-        target_is_dir: bool,
-    ) -> bool {
-        self.passthrough_rules
+    pub fn is_bypass(&self, kind: ProtectionKind, path: &SandboxPath, target_is_dir: bool) -> bool {
+        self.bypass_rules
             .iter()
             .any(|rule| rule.kind == kind && rule.matches(path, target_is_dir))
     }

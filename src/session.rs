@@ -145,28 +145,28 @@ impl SessionState {
                 kind,
                 pattern,
             } => self.unprotect(&name, kind, pattern),
-            Request::Passthrough {
+            Request::Bypass {
                 name,
                 kind,
                 pattern,
-            } => self.passthrough(&name, kind, pattern),
-            Request::Unpassthrough {
+            } => self.bypass(&name, kind, pattern),
+            Request::Unbypass {
                 name,
                 kind,
                 pattern,
-            } => self.unpassthrough(&name, kind, pattern),
+            } => self.unbypass(&name, kind, pattern),
             Request::ListProtection {
                 name,
                 include_read,
                 include_write,
                 include_metadata,
             } => self.list_protection(&name, include_read, include_write, include_metadata),
-            Request::ListPassthrough {
+            Request::ListBypass {
                 name,
                 include_read,
                 include_write,
                 include_metadata,
-            } => self.list_passthrough(&name, include_read, include_write, include_metadata),
+            } => self.list_bypass(&name, include_read, include_write, include_metadata),
             Request::ListMounts { name } => self.list_mounts(&name),
             Request::Metadata { name } => self.metadata(&name),
             Request::BeginTrustedOperation {
@@ -455,25 +455,20 @@ impl SessionState {
         Ok(Response::Ok)
     }
 
-    fn passthrough(
-        &self,
-        name: &str,
-        kind: ProtectionKind,
-        pattern: PolicyPattern,
-    ) -> Result<Response> {
+    fn bypass(&self, name: &str, kind: ProtectionKind, pattern: PolicyPattern) -> Result<Response> {
         let mut registry = self.registry.lock().unwrap();
         let id = registry.next_operation_id();
         let sandbox = registry
             .sandboxes
             .get_mut(name)
             .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
-        let result = sandbox.add_passthrough(kind, pattern.clone());
+        let result = sandbox.add_bypass(kind, pattern.clone());
         self.log_writer.append(
             &sandbox.log_path,
             log::format_log_line(
                 id,
                 &format!(
-                    "passthrough kind={kind} pattern={pattern} result={}",
+                    "bypass kind={kind} pattern={pattern} result={}",
                     result.log_name()
                 ),
             ),
@@ -481,7 +476,7 @@ impl SessionState {
         Ok(Response::Ok)
     }
 
-    fn unpassthrough(
+    fn unbypass(
         &self,
         name: &str,
         kind: ProtectionKind,
@@ -493,13 +488,13 @@ impl SessionState {
             .sandboxes
             .get_mut(name)
             .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
-        let result = sandbox.remove_passthrough(kind, pattern.clone());
+        let result = sandbox.remove_bypass(kind, pattern.clone());
         self.log_writer.append(
             &sandbox.log_path,
             log::format_log_line(
                 id,
                 &format!(
-                    "unpassthrough kind={kind} pattern={pattern} result={}",
+                    "unbypass kind={kind} pattern={pattern} result={}",
                     result.log_name()
                 ),
             ),
@@ -524,7 +519,7 @@ impl SessionState {
         })
     }
 
-    fn list_passthrough(
+    fn list_bypass(
         &self,
         name: &str,
         include_read: bool,
@@ -536,8 +531,8 @@ impl SessionState {
             .sandboxes
             .get(name)
             .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
-        Ok(Response::PassthroughRules {
-            items: sandbox.passthrough_rules(include_read, include_write, include_metadata),
+        Ok(Response::BypassRules {
+            items: sandbox.bypass_rules(include_read, include_write, include_metadata),
         })
     }
 

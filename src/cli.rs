@@ -15,9 +15,8 @@ use crate::path::{SandboxPath, rewrite_sandbox_path_arg};
 use crate::runtime::RuntimePaths;
 use crate::session;
 use crate::state::{
-    DEFAULT_READ_WRITE_GRANT_DURATION, PassthroughRule, PendingRequest, PolicyPattern,
-    ProtectionKind, ProtectionRule, ReadWriteGrantLifetimeRequest, ReadWriteGrantOptions,
-    TrustedPathScope,
+    BypassRule, DEFAULT_READ_WRITE_GRANT_DURATION, PendingRequest, PolicyPattern, ProtectionKind,
+    ProtectionRule, ReadWriteGrantLifetimeRequest, ReadWriteGrantOptions, TrustedPathScope,
 };
 use crate::{Error, Result};
 
@@ -85,22 +84,22 @@ enum SandboxCommand {
     UnprotectMetadata {
         pattern: String,
     },
-    PassthroughRead {
+    BypassRead {
         pattern: String,
     },
-    PassthroughWrite {
+    BypassWrite {
         pattern: String,
     },
-    PassthroughMetadata {
+    BypassMetadata {
         pattern: String,
     },
-    UnpassthroughRead {
+    UnbypassRead {
         pattern: String,
     },
-    UnpassthroughWrite {
+    UnbypassWrite {
         pattern: String,
     },
-    UnpassthroughMetadata {
+    UnbypassMetadata {
         pattern: String,
     },
     ListProtection {
@@ -111,7 +110,7 @@ enum SandboxCommand {
         #[arg(long, action = ArgAction::SetTrue)]
         metadata: bool,
     },
-    ListPassthrough {
+    ListBypass {
         #[arg(long, action = ArgAction::SetTrue)]
         read: bool,
         #[arg(long, action = ArgAction::SetTrue)]
@@ -283,37 +282,37 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
             ProtectionKind::Metadata,
             PolicyPattern::new(pattern)?,
         ),
-        SandboxCommand::PassthroughRead { pattern } => passthrough(
+        SandboxCommand::BypassRead { pattern } => bypass(
             runtime,
             &name,
             ProtectionKind::Read,
             PolicyPattern::new(pattern)?,
         ),
-        SandboxCommand::PassthroughWrite { pattern } => passthrough(
+        SandboxCommand::BypassWrite { pattern } => bypass(
             runtime,
             &name,
             ProtectionKind::Write,
             PolicyPattern::new(pattern)?,
         ),
-        SandboxCommand::PassthroughMetadata { pattern } => passthrough(
+        SandboxCommand::BypassMetadata { pattern } => bypass(
             runtime,
             &name,
             ProtectionKind::Metadata,
             PolicyPattern::new(pattern)?,
         ),
-        SandboxCommand::UnpassthroughRead { pattern } => unpassthrough(
+        SandboxCommand::UnbypassRead { pattern } => unbypass(
             runtime,
             &name,
             ProtectionKind::Read,
             PolicyPattern::new(pattern)?,
         ),
-        SandboxCommand::UnpassthroughWrite { pattern } => unpassthrough(
+        SandboxCommand::UnbypassWrite { pattern } => unbypass(
             runtime,
             &name,
             ProtectionKind::Write,
             PolicyPattern::new(pattern)?,
         ),
-        SandboxCommand::UnpassthroughMetadata { pattern } => unpassthrough(
+        SandboxCommand::UnbypassMetadata { pattern } => unbypass(
             runtime,
             &name,
             ProtectionKind::Metadata,
@@ -333,14 +332,14 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
                 include_metadata: metadata,
             },
         )?),
-        SandboxCommand::ListPassthrough {
+        SandboxCommand::ListBypass {
             read,
             write,
             metadata,
         } => print_response(send(
             runtime,
             &name,
-            &Request::ListPassthrough {
+            &Request::ListBypass {
                 name: name.clone(),
                 include_read: read,
                 include_write: write,
@@ -511,7 +510,7 @@ fn unprotect(
     )?)
 }
 
-fn passthrough(
+fn bypass(
     runtime: &RuntimePaths,
     name: &str,
     kind: ProtectionKind,
@@ -520,7 +519,7 @@ fn passthrough(
     print_response(send(
         runtime,
         name,
-        &Request::Passthrough {
+        &Request::Bypass {
             name: name.to_string(),
             kind,
             pattern,
@@ -528,7 +527,7 @@ fn passthrough(
     )?)
 }
 
-fn unpassthrough(
+fn unbypass(
     runtime: &RuntimePaths,
     name: &str,
     kind: ProtectionKind,
@@ -537,7 +536,7 @@ fn unpassthrough(
     print_response(send(
         runtime,
         name,
-        &Request::Unpassthrough {
+        &Request::Unbypass {
             name: name.to_string(),
             kind,
             pattern,
@@ -582,8 +581,8 @@ fn print_response(response: Response) -> Result<i32> {
             }
             Ok(0)
         }
-        Response::PassthroughRules { items } => {
-            let text = format_passthrough_rules(&items);
+        Response::BypassRules { items } => {
+            let text = format_bypass_rules(&items);
             if !text.is_empty() {
                 println!("{text}");
             }
@@ -613,7 +612,7 @@ fn format_protection_rules(items: &[ProtectionRule]) -> String {
         .join("\n")
 }
 
-fn format_passthrough_rules(items: &[PassthroughRule]) -> String {
+fn format_bypass_rules(items: &[BypassRule]) -> String {
     items
         .iter()
         .map(|item| format!("{} {}", item.kind, item.pattern))

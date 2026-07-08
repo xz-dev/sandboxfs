@@ -135,11 +135,11 @@ for path_dir in "${HOST_PATH_DIRS[@]}"; do
     sf protect-write "$path_dir/**"
 done
 sf mount "$HOST_CWD" "$HOST_CWD"
-sf passthrough-write "$HOST_TMPDIR/pi.*/"
-sf passthrough-write "$HOST_HOME/.pi/agent/settings.json.lock"
-sf passthrough-metadata "$HOST_HOME/.pi/agent/settings.json.lock"
-sf passthrough-write "$HOST_HOME/.pi/agent/trust.json.lock"
-sf passthrough-metadata "$HOST_HOME/.pi/agent/trust.json.lock"
+sf bypass-write "$HOST_TMPDIR/pi.*/"
+sf bypass-write "$HOST_HOME/.pi/agent/settings.json.lock"
+sf bypass-metadata "$HOST_HOME/.pi/agent/settings.json.lock"
+sf bypass-write "$HOST_HOME/.pi/agent/trust.json.lock"
+sf bypass-metadata "$HOST_HOME/.pi/agent/trust.json.lock"
 
 sf attach "$ATTACH_DIR"
 

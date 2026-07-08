@@ -114,8 +114,31 @@ pub fn mkdir(path: &Path, mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+pub fn symlink(target: &Path, link_path: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link_path)
+}
+
+pub fn hard_link(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(from, to)
+}
+
+pub fn unlink(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
 pub fn rmdir(path: &Path) -> std::io::Result<()> {
     std::fs::remove_dir(path)
+}
+
+pub fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+pub fn truncate(path: &Path, size: u64) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_len(size)
 }
 
 pub fn set_times(
