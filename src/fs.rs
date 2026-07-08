@@ -67,6 +67,7 @@ struct HandleInfo {
     local_path: PathBuf,
     sandbox_path: SandboxPath,
     writable: bool,
+    append: bool,
 }
 
 struct PendingMetadataOutcome {
@@ -860,6 +861,7 @@ impl Filesystem for SandboxFs {
             return;
         };
         let writable = flags.acc_mode() != OpenAccMode::O_RDONLY;
+        let append = flags.0 & libc::O_APPEND != 0;
         if writable {
             match self.authorize_read_write(
                 RequestIdentity::from_request(req),
@@ -896,6 +898,7 @@ impl Filesystem for SandboxFs {
                         local_path,
                         sandbox_path: path.clone(),
                         writable,
+                        append,
                     },
                 );
                 reply.opened(FileHandle(fh), FopenFlags::empty());
@@ -1321,13 +1324,14 @@ impl Filesystem for SandboxFs {
                 return;
             }
         }
-        match OpenOptions::new()
-            .write(true)
-            .open(&handle.local_path)
-            .and_then(|mut file| {
+        let mut options = OpenOptions::new();
+        options.write(true).append(handle.append);
+        match options.open(&handle.local_path).and_then(|mut file| {
+            if !handle.append {
                 file.seek(SeekFrom::Start(offset))?;
-                file.write(data)
-            }) {
+            }
+            file.write(data)
+        }) {
             Ok(written) => reply.written(written as u32),
             Err(err) => reply.error(io_to_errno(err)),
         }
@@ -1399,6 +1403,7 @@ impl Filesystem for SandboxFs {
                         local_path,
                         sandbox_path: path,
                         writable: true,
+                        append: flags & libc::O_APPEND != 0,
                     },
                 );
                 reply.created(

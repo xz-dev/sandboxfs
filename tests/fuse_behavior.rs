@@ -1032,6 +1032,88 @@ fn bypass_write_allows_matching_write_effects_without_pending() {
 
 #[test]
 #[ignore]
+fn append_open_writes_at_end_even_with_zero_offset() {
+    require_fuse();
+    if !fuse_enabled() {
+        return;
+    }
+    let session = RunningSession::start("demo_fuse_append_flag");
+    let local = session.temp.path().join("local");
+    let mountpoint = session.temp.path().join("mnt");
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&mountpoint).unwrap();
+    fs::write(local.join("file"), "base").unwrap();
+
+    session
+        .sandbox_cmd()
+        .args(["mount", local.to_str().unwrap(), "/data"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["bypass-write", "/data/file"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["attach", mountpoint.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("printf plus >> \"$1\"")
+        .arg("sh")
+        .arg(mountpoint.join("data/file"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(fs::read_to_string(local.join("file")).unwrap(), "baseplus");
+}
+
+#[test]
+#[ignore]
+fn create_exclusive_fails_when_target_exists() {
+    require_fuse();
+    if !fuse_enabled() {
+        return;
+    }
+    let session = RunningSession::start("demo_fuse_create_exclusive");
+    let local = session.temp.path().join("local");
+    let mountpoint = session.temp.path().join("mnt");
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&mountpoint).unwrap();
+    fs::write(local.join("file"), "existing").unwrap();
+
+    session
+        .sandbox_cmd()
+        .args(["mount", local.to_str().unwrap(), "/data"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["bypass-write", "/data/file"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["attach", mountpoint.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("set -C; : > \"$1\"")
+        .arg("sh")
+        .arg(mountpoint.join("data/file"))
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    assert_eq!(fs::read_to_string(local.join("file")).unwrap(), "existing");
+}
+
+#[test]
+#[ignore]
 fn protected_mknod_fifo_allow_forwards_to_backing_filesystem() {
     require_fuse();
     if !fuse_enabled() {

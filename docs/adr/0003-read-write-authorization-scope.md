@@ -4,7 +4,7 @@
 
 Accepted, partially superseded by [ADR 0007](0007-bypass-and-effect-based-authorization.md).
 
-ADR 0007 supersedes this ADR's earlier assumption that sandboxfs remains read-only after protected write authorization. In the bypass/effect model, allowed write effects execute the corresponding backing filesystem operation where sandboxfs implements that operation; unsupported operations such as `mknod` can fail without first creating a misleading protected-write pending request.
+ADR 0007 supersedes this ADR's earlier assumption that sandboxfs remains read-only after protected write authorization. Treat this ADR's write-execution/read-only language as obsolete historical context; the current model is ADR 0007's bypass/effect model, where allowed write effects are forwarded to the backing filesystem and backing filesystem/kernel errno is authoritative.
 
 ## Context
 
