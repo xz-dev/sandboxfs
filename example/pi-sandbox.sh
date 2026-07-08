@@ -6,15 +6,16 @@ set -euo pipefail
 # sandboxfs is used here to make the agent's filesystem view and operations
 # observable, not to provide a strong isolation boundary. The view starts from
 # host /, hides /home and $HOME, then re-exposes $HOME/.pi, $HOME/.agents,
-# the caller's PATH directories, and the current working directory. The wrapped
-# process inherits the caller's environment; this script only sets PATH.
+# the caller's PATH directories, and the current working directory. Re-exposed
+# PATH directories and $HOME/.agents are protected against write and metadata
+# changes. The wrapped process inherits the caller's environment; this script
+# only sets PATH.
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 HOST_CWD=$(pwd -P)
 HOST_HOME=${HOME:?HOME must be set}
 HOST_TMPDIR=${TMPDIR:-/tmp}
 HOST_PATH=${PATH:-}
-SANDBOXED_PATH=${PI_SANDBOX_PATH:-$HOST_PATH}
 
 require_executable() {
     local name=$1
@@ -59,7 +60,7 @@ require_executable "$BWRAP_BIN"
 SANDBOXFS_BIN=$(resolve_sandboxfs)
 PI_BIN=$(resolve_pi)
 
-TMP_ROOT=$(mktemp -d -p /tmp pi-sandbox.XXXXXXXXXX)
+TMP_ROOT=$(mktemp -d -p "$HOST_TMPDIR" pi-sandbox.XXXXXXXXXX)
 RUNTIME_DIR=$TMP_ROOT/run
 LOG_DIR=$TMP_ROOT/logs
 ATTACH_DIR=$TMP_ROOT/root
@@ -72,6 +73,14 @@ sf() {
     SANDBOXFS_RUNTIME_DIR=$RUNTIME_DIR \
     SANDBOXFS_LOG_DIR=$LOG_DIR \
         "$SANDBOXFS_BIN" "$SESSION_NAME" "$@"
+}
+
+protect_readonly_tree() {
+    local path=$1
+    sf protect-write "$path/"
+    sf protect-write "$path/**"
+    sf protect-metadata "$path/"
+    sf protect-metadata "$path/**"
 }
 
 cleanup() {
@@ -118,12 +127,15 @@ if [[ ! -S $SOCKET ]]; then
 fi
 
 # Base view: root redirect for observability, with home details hidden and only
-# the pi config directory plus the current working directory re-exposed.
+# the workflow's required user paths re-exposed.
 sf mount / /
 sf hide /home
 sf hide "$HOST_HOME"
 sf mount "$HOST_HOME/.pi" "$HOST_HOME/.pi"
-sf mount "$HOST_HOME/.agents" "$HOST_HOME/.agents"
+if [[ -d "$HOST_HOME/.agents" ]]; then
+    sf mount "$HOST_HOME/.agents" "$HOST_HOME/.agents"
+    protect_readonly_tree "$HOST_HOME/.agents"
+fi
 IFS=: read -r -a HOST_PATH_DIRS <<< "$HOST_PATH"
 for path_dir in "${HOST_PATH_DIRS[@]}"; do
     [[ -n $path_dir && -d $path_dir && $path_dir = /* ]] || continue
@@ -131,11 +143,9 @@ for path_dir in "${HOST_PATH_DIRS[@]}"; do
         path_dir=${path_dir%/}
     done
     sf mount "$path_dir" "$path_dir"
-    sf protect-write "$path_dir/"
-    sf protect-write "$path_dir/**"
+    protect_readonly_tree "$path_dir"
 done
 sf mount "$HOST_CWD" "$HOST_CWD"
-sf bypass-write "$HOST_TMPDIR/pi.*/"
 sf bypass-write "$HOST_HOME/.pi/agent/settings.json.lock"
 sf bypass-metadata "$HOST_HOME/.pi/agent/settings.json.lock"
 sf bypass-write "$HOST_HOME/.pi/agent/trust.json.lock"
@@ -162,5 +172,5 @@ EOF
     --dev /dev \
     --proc /proc \
     --chdir "$HOST_CWD" \
-    --setenv PATH "$SANDBOXED_PATH" \
+    --setenv PATH "$HOST_PATH" \
     "$PI_BIN" "$@"

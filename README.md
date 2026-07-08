@@ -84,7 +84,7 @@ Ctrl-C in the `sandboxfs run demo` terminal also stops the session.
 
 ## AI agent wrapper example
 
-`example/pi-sandbox.sh` shows the intended integration shape for an AI coding agent: use Bubblewrap for the process/container boundary, then put `sandboxfs` inside that boundary as the observable filesystem policy layer. The wrapper keeps the agent-facing view simple while allowing selected paths, PATH tools, lock directories, and protected operations to be managed through `sandboxfs` policy instead of static bind mounts alone.
+`example/pi-sandbox.sh` shows the intended integration shape for an AI coding agent: use Bubblewrap for the process/container boundary, then put `sandboxfs` inside that boundary as the observable filesystem policy layer. The wrapper keeps the agent-facing view simple while re-exposing the current workspace, Pi configuration, agent skills, and the caller's PATH tools. User-owned tool/config paths are protected with write and metadata rules, while Pi's known lock directories get narrow bypass rules for compatibility.
 
 ## Documentation
 

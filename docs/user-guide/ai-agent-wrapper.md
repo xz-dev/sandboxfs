@@ -7,7 +7,7 @@
 3. initialize the view and policy explicitly from a small script;
 4. run the agent with only the paths and compatibility shims that workflow needs.
 
-The wrapper is intentionally a demo and self-use example, not a general framework. It keeps the agent-facing filesystem view simple while using `sandboxfs` commands for the parts that need runtime visibility or adjustment.
+The wrapper is intentionally a demo and self-use example, not a general framework. It keeps the agent-facing filesystem view simple: start from host `/`, hide `/home` and `$HOME`, then re-expose Pi configuration, agent skills, the caller's PATH tools, and the current workspace. Re-exposed user-owned tool/config paths are protected with write and metadata rules, while Pi's known lock directories get narrow bypass rules for compatibility.
 
 ## Why AI agents
 
@@ -26,7 +26,7 @@ Static filesystem policy is awkward for that workflow:
 
 `sandboxfs` does not have a persistent configuration file. Agent wrappers should initialize policy through ordinary commands each time they start a session.
 
-This keeps each integration explicit and avoids a configuration format that grows with every new compatibility need. For example, an AI agent wrapper can decide at startup which paths are visible, which PATH directories are write-protected, which lock directories need bypass rules, and which operations should become pending authorization requests.
+This keeps each integration explicit and avoids a configuration format that grows with every new compatibility need. For example, an AI agent wrapper can decide at startup which paths are visible, which PATH directories are write- and metadata-protected, which lock directories need bypass rules, and which operations should become pending authorization requests.
 
 ## Relationship to Bubblewrap and similar tools
 
