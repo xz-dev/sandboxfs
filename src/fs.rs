@@ -451,6 +451,7 @@ impl SandboxFs {
             .map(|grant| (registry.next_operation_id(), grant.id))
             .collect();
         let mut consumed_events = Vec::new();
+        let mut pending_ids = Vec::new();
         let mut waiters = Vec::new();
 
         for effect in operation.effects() {
@@ -506,6 +507,7 @@ impl SandboxFs {
                 .with_process_identity(process_identity),
             );
             registry.pending_waiters.insert(id, Arc::clone(&waiter));
+            pending_ids.push(id);
             waiters.push(waiter);
         }
         drop(registry);
@@ -529,14 +531,34 @@ impl SandboxFs {
             );
         }
 
-        for waiter in waiters {
-            match wait_for_decision(&waiter) {
+        let mut final_decision = ReadWriteDecision::Proceed;
+        for waiter in &waiters {
+            match wait_for_decision(waiter) {
                 PendingDecision::Apply | PendingDecision::DoNothing => {}
-                PendingDecision::Deny => return Ok(ReadWriteDecision::Denied),
-                PendingDecision::Cancel => return Ok(ReadWriteDecision::Canceled),
+                PendingDecision::Deny => {
+                    final_decision = ReadWriteDecision::Denied;
+                    break;
+                }
+                PendingDecision::Cancel => {
+                    final_decision = ReadWriteDecision::Canceled;
+                    break;
+                }
             }
         }
-        Ok(ReadWriteDecision::Proceed)
+        if final_decision != ReadWriteDecision::Proceed {
+            self.cancel_unresolved_read_write_effects(&pending_ids, &waiters);
+        }
+        Ok(final_decision)
+    }
+
+    fn cancel_unresolved_read_write_effects(&self, pending_ids: &[u64], waiters: &[PendingWaiter]) {
+        let mut registry = self.registry.lock().unwrap();
+        for (id, waiter) in pending_ids.iter().zip(waiters) {
+            if registry.remove_pending_read_write_request(*id).is_some() {
+                registry.pending_waiters.remove(id);
+                notify_waiter(Some(Arc::clone(waiter)), PendingDecision::Cancel);
+            }
+        }
     }
 
     fn finish_pending_attr(
@@ -1436,7 +1458,7 @@ impl Filesystem for SandboxFs {
 
     fn mknod(
         &self,
-        req: &Request,
+        _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         _mode: u32,
@@ -1444,19 +1466,11 @@ impl Filesystem for SandboxFs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        let Ok(path) = self.path_child(parent, name) else {
+        if self.path_child(parent, name).is_err() {
             reply.error(Errno::ENOENT);
             return;
-        };
-        match self.authorize_read_write(
-            RequestIdentity::from_request(req),
-            ReadWriteOperation::Mknod { path },
-        ) {
-            Ok(ReadWriteDecision::Proceed) => reply.error(Errno::EROFS),
-            Ok(ReadWriteDecision::Denied) => reply.error(Errno::EACCES),
-            Ok(ReadWriteDecision::Canceled) => reply.error(Errno::ECANCELED),
-            Err(err) => reply.error(err),
         }
+        reply.error(Errno::EROFS);
     }
 
     fn symlink(

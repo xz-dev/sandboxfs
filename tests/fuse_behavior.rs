@@ -1161,6 +1161,76 @@ fn metadata_protection_blocks_truncate_even_when_write_is_bypassed() {
 
 #[test]
 #[ignore]
+fn protected_hardlink_cleans_up_sibling_pending_after_deny() {
+    require_fuse();
+    if !fuse_enabled() {
+        return;
+    }
+    let session = RunningSession::start("demo_fuse_hardlink_deny_cleanup");
+    let local = session.temp.path().join("local");
+    let mountpoint = session.temp.path().join("mnt");
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&mountpoint).unwrap();
+    fs::write(local.join("file"), "hello").unwrap();
+
+    session
+        .sandbox_cmd()
+        .args(["mount", local.to_str().unwrap(), "/data"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["protect-metadata", "/data/file"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["protect-write", "/data/hard"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
+        .args(["attach", mountpoint.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let mut child = std::process::Command::new("ln")
+        .args([
+            mountpoint.join("data/file").to_str().unwrap(),
+            mountpoint.join("data/hard").to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(3), || {
+        session
+            .sandbox_cmd()
+            .arg("allow")
+            .output()
+            .map(|out| pending_ids(&String::from_utf8_lossy(&out.stdout)).len() == 2)
+            .unwrap_or(false)
+    }));
+    let pending =
+        String::from_utf8(session.sandbox_cmd().arg("allow").output().unwrap().stdout).unwrap();
+    let ids = pending_ids(&pending);
+    session
+        .sandbox_cmd()
+        .args(["deny", &ids[0]])
+        .assert()
+        .success();
+    assert!(!wait_child(&mut child).success());
+    assert!(wait_until(Duration::from_secs(3), || {
+        session
+            .sandbox_cmd()
+            .arg("allow")
+            .output()
+            .map(|out| out.stdout.is_empty())
+            .unwrap_or(false)
+    }));
+    assert!(!local.join("hard").exists());
+}
+
+#[test]
+#[ignore]
 fn protected_hardlink_requires_source_metadata_and_destination_write_effects() {
     require_fuse();
     if !fuse_enabled() {
