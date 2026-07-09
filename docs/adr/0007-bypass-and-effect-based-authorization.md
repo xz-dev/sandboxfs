@@ -34,9 +34,11 @@ gatefs <name> unbypass-xattr <glob>
 gatefs <name> list-bypass [--read] [--write] [--metadata] [--xattr]
 ```
 
-`bypass-*` rules are layer-specific. A matching `bypass-write` automatically allows the matching write effect; it does not bypass metadata effects. A matching `bypass-metadata` automatically allows the matching metadata effect; it does not bypass write effects. A matching `bypass-xattr` automatically allows matching xattr mutation effects only; it does not bypass chmod, chown, chattr, timestamp, read, or write effects. Because xattr mutations are also metadata effects for broad metadata policy, either `bypass-xattr` or `bypass-metadata` automatically allows a matching xattr mutation that would otherwise be pending under `protect-xattr` or `protect-metadata`.
+`bypass-*` rules are layer-specific. A matching `bypass-write` automatically allows the matching write effect; it does not bypass ordinary metadata effects such as chmod, chown, chattr, or timestamps. A matching `bypass-metadata` automatically allows the matching metadata mutation effect; it does not bypass ordinary file-content or namespace write effects. A matching `bypass-xattr` automatically allows matching xattr read and mutation effects; it does not bypass chmod, chown, chattr, timestamp, ordinary file-content, or namespace effects.
 
-Authorization is evaluated per filesystem effect, not per command name. Each effect has a policy layer (`READ`, `WRITE`, or `METADATA`) and a sandbox path. For each effect:
+Xattr operations intentionally bridge layers. `getxattr` and `listxattr` are both `READ` and `XATTR` effects. `setxattr` and `removexattr` are `WRITE`, `METADATA`, and `XATTR` effects. `protect-metadata` remains mutation-oriented and does not gate `getxattr` or `listxattr`.
+
+Authorization is evaluated per filesystem effect, not per command name. Each effect has a policy layer (`READ`, `WRITE`, `METADATA`, or `XATTR`) and a sandbox path. For each effect:
 
 1. if a matching `bypass-*` rule exists for that effect's layer and path, that effect is automatically allowed;
 2. otherwise, if a matching `protect-*` rule exists for that effect's layer and path, that effect requires pending authorization;

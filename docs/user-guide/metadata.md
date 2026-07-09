@@ -21,11 +21,11 @@ chmod 444 "$DEMO_MNT/file.txt"
 
 That protected request becomes pending and can be resolved through the normal pending authorization flow.
 
-## Xattr mutations
+## Xattr operations
 
-Xattr mutations are forwarded to the backing filesystem after policy allows them. They are not virtualized into sandbox-local overrides.
+Xattr operations are forwarded to the backing filesystem after policy allows them. They are not virtualized into sandbox-local overrides.
 
-Use xattr-specific protection and bypass rules when you want `setxattr` or `removexattr` to participate in policy:
+Use xattr-specific protection and bypass rules when you want `getxattr`, `listxattr`, `setxattr`, or `removexattr` to participate in policy:
 
 ```sh
 gatefs demo protect-xattr '/data/**'
@@ -34,9 +34,9 @@ gatefs demo unprotect-xattr '/data/**'
 gatefs demo unbypass-xattr '/data/cache/**'
 ```
 
-`protect-xattr` and `bypass-xattr` apply only to xattr mutation effects. They do not gate `getxattr` or `listxattr`, which remain ungated metadata probes.
+`protect-xattr` and `bypass-xattr` apply to the xattr surface: `getxattr`, `listxattr`, `setxattr`, and `removexattr`. Xattr reads also participate in broad read policy (`protect-read`/`bypass-read`), while xattr mutations also participate in broad write policy (`protect-write`/`bypass-write`).
 
-`protect-metadata` and `bypass-metadata` remain broader controls and continue to include xattr mutations. A matching xattr bypass or metadata bypass automatically allows an xattr mutation that would otherwise be pending under either xattr-specific or metadata protection.
+`protect-metadata` and `bypass-metadata` remain mutation-oriented broader controls. They continue to include `setxattr` and `removexattr`, but they do not gate `getxattr` or `listxattr`.
 
 ## Metadata bypass
 

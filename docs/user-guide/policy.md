@@ -67,7 +67,7 @@ gatefs demo list-bypass [--read] [--write] [--metadata] [--xattr]
 
 `bypass-*` rules are layer-specific. `bypass-write` automatically allows matching write effects, but it does not bypass metadata protection. `bypass-metadata` automatically allows matching metadata effects, but it does not bypass write protection.
 
-`bypass-xattr` automatically allows matching xattr mutation effects, including xattr mutations that would otherwise be pending because of broad `protect-metadata`. It does not bypass chmod, chown, chattr, timestamp, read, or write effects. `protect-xattr` and `bypass-xattr` only apply to xattr mutations (`setxattr` and `removexattr`). They do not gate `getxattr` or `listxattr`.
+`bypass-xattr` automatically allows matching xattr effects. For xattr reads, it can release operations that would otherwise be pending under `protect-read` or `protect-xattr`. For xattr mutations, it can release operations that would otherwise be pending under `protect-write`, `protect-metadata`, or `protect-xattr`. It does not bypass chmod, chown, chattr, timestamp, ordinary file-content, or namespace effects. `protect-xattr` and `bypass-xattr` apply to `getxattr`, `listxattr`, `setxattr`, and `removexattr`.
 
 This matters because a single FUSE operation can have multiple effects. For example, truncate changes file size/content semantics, so it has a `WRITE` effect, but it also updates metadata. If `protect-metadata` matches and `bypass-metadata` does not, truncate must not automatically succeed even when its write effect is otherwise allowed or covered by `bypass-write`.
 
@@ -87,8 +87,9 @@ This table describes the user-visible policy model for common FUSE operations. I
 | Rename | Source path and destination path | `WRITE` on each affected path |
 | Hard link | Existing source path and new destination path | `METADATA` on the source path; `WRITE` on the destination path |
 | `chmod`, `chown`, `chattr`, timestamp updates, inode-flag ioctls | Target path | `METADATA` |
-| `setxattr`, `removexattr` | Target path | `METADATA` for broad metadata policy; xattr-specific policy also applies when configured; allowed xattr mutations are forwarded to the backing filesystem |
-| `getxattr`, `listxattr`, `lookup`, `getattr`, opening a read handle, opening a directory handle | Target path | No protected effect by default |
+| `setxattr`, `removexattr` | Target path | `WRITE`, `METADATA`, and `XATTR`; allowed xattr mutations are forwarded to the backing filesystem |
+| `getxattr`, `listxattr` | Target path | `READ` and `XATTR`; allowed xattr reads are forwarded to the backing filesystem |
+| `lookup`, `getattr`, opening a read handle, opening a directory handle | Target path | No protected effect by default |
 
 Directory-entry operations use the entry path as the write effect path. For example, creating `/data/new` is a `WRITE` effect on `/data/new`, not a recursive write effect on `/data` or `/`. This keeps protection scoped to the path pattern the operator configured. If every create/delete also became a write on all ancestor directories, broad parent patterns would collapse most useful policy toward the root of the visible tree and make narrow protection rules much harder to reason about.
 

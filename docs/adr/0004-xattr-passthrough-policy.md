@@ -14,13 +14,13 @@ However, partially filtering, synthesizing, or emulating xattrs in gatefs would 
 
 gatefs treats xattr operations as forwarding to the resolved backing filesystem path after policy allows them.
 
-`getxattr` and `listxattr` are metadata probes, not protected READ operations. They resolve the sandbox namespace path, reject hidden or virtual-only paths as unavailable, then call the backing filesystem and preserve its support and errno behavior.
+`getxattr` and `listxattr` are xattr read probes. They resolve the sandbox namespace path, reject hidden or virtual-only paths as unavailable, then call the backing filesystem and preserve its support and errno behavior after policy allows them. They are governed by `protect-read`/`bypass-read` and by `protect-xattr`/`bypass-xattr`.
 
-`setxattr` and `removexattr` are backing-host metadata mutations. Because gatefs does not manage xattr overlays, allowed xattr writes are not converted into sandbox-local overrides. They are forwarded to the backing filesystem and preserve its support and errno behavior.
+`setxattr` and `removexattr` are backing-host xattr mutations. Because gatefs does not manage xattr overlays, allowed xattr writes are not converted into sandbox-local overrides. They are forwarded to the backing filesystem and preserve its support and errno behavior. They are governed by `protect-write`/`bypass-write`, `protect-metadata`/`bypass-metadata`, and `protect-xattr`/`bypass-xattr`.
 
-`protect-xattr` and `bypass-xattr` apply only to xattr mutation effects. They control `setxattr` and `removexattr`; they do not gate `getxattr` or `listxattr`.
+`protect-xattr` and `bypass-xattr` apply to the xattr surface: `getxattr`, `listxattr`, `setxattr`, and `removexattr`. They do not control chmod, chown, chattr, timestamp, file-content, or namespace effects.
 
-`protect-metadata` and `bypass-metadata` remain broader metadata controls and continue to include xattr mutations. A matching xattr bypass or metadata bypass automatically allows an xattr mutation that would otherwise be pending under either xattr-specific or metadata protection.
+`protect-metadata` and `bypass-metadata` remain mutation-oriented broader metadata controls. They continue to include `setxattr` and `removexattr`, but they do not gate `getxattr` or `listxattr`. A matching xattr bypass or metadata bypass automatically allows an xattr mutation that would otherwise be pending under either xattr-specific or metadata protection; read/write protection for the same xattr operation is evaluated separately unless `bypass-xattr` also matches.
 
 gatefs does not filter, synthesize, or specially interpret `security.*`, `system.*`, `trusted.*`, SELinux, capability, ACL, or other xattr namespaces in this decision. Those values may reflect backing-host context, but host passthrough is reproducible. Partial gatefs emulation is more likely to produce unstable and surprising behavior.
 
