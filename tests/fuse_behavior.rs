@@ -692,7 +692,7 @@ fn protected_xattr_write_is_gated_by_write_policy() {
 
 #[test]
 #[ignore]
-fn metadata_bypass_releases_xattr_protected_xattr() {
+fn metadata_bypass_does_not_release_xattr_protected_xattr() {
     require_fuse();
     if !fuse_enabled() {
         return;
@@ -725,12 +725,16 @@ fn metadata_bypass_releases_xattr_protected_xattr() {
         .assert()
         .success();
 
-    set_xattr(&mountpoint.join("data/file"), "user.allowed", b"value").unwrap();
+    let child = std::thread::spawn({
+        let path = mountpoint.join("data/file");
+        move || set_xattr(&path, "user.xattr_protected", b"value")
+    });
+    let id = wait_for_pending(&session, "SETXATTR name=user.xattr_protected");
+    session.sandbox_cmd().args(["deny", &id]).assert().success();
     assert_eq!(
-        get_xattr(&local.join("file"), "user.allowed").unwrap(),
-        b"value"
+        child.join().unwrap().unwrap_err().raw_os_error(),
+        Some(libc::EACCES)
     );
-    assert_no_pending(&session);
 }
 
 #[test]
@@ -776,7 +780,7 @@ fn write_bypass_does_not_release_xattr_protected_xattr() {
     session.sandbox_cmd().args(["deny", &id]).assert().success();
     assert_eq!(
         child.join().unwrap().unwrap_err().raw_os_error(),
-        Some(libc::EPERM)
+        Some(libc::EACCES)
     );
 }
 
@@ -823,7 +827,7 @@ fn write_bypass_does_not_release_metadata_protected_xattr() {
     session.sandbox_cmd().args(["deny", &id]).assert().success();
     assert_eq!(
         child.join().unwrap().unwrap_err().raw_os_error(),
-        Some(libc::EPERM)
+        Some(libc::EACCES)
     );
 }
 
@@ -932,13 +936,7 @@ fn protected_removexattr_write_is_gated_by_policy(protection_command: &str, sess
     assert_eq!(err.raw_os_error(), Some(libc::ENODATA));
 
     let log = session_log(&session);
-    assert_log_line_contains(
-        &log,
-        &[
-            " pending ",
-            "path=/data/file REMOVEXATTR name=user.gated_remove",
-        ],
-    );
+    assert_log_line_contains(&log, &[" pending ", "REMOVEXATTR name=user.gated_remove"]);
     assert_log_line_contains(&log, &["decision", &format!("request={id}"), "ALLOW"]);
 }
 

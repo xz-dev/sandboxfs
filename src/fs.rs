@@ -224,52 +224,11 @@ impl SandboxFs {
         Ok(sandbox.is_bypass(kind, path, target_is_dir))
     }
 
-    fn xattr_mutation_bypassed_or_protected(
-        &self,
-        path: &SandboxPath,
-    ) -> std::result::Result<(bool, bool), Errno> {
-        let target_is_dir = self.path_is_directory(path)?;
-        let bypass_metadata =
-            self.path_matches_bypass(ProtectionKind::Metadata, path, target_is_dir)?;
-        let bypass_xattr = self.path_matches_bypass(ProtectionKind::Xattr, path, target_is_dir)?;
-        let registry = self.registry.lock().unwrap();
-        let sandbox = registry
-            .sandboxes
-            .get(&self.sandbox_name)
-            .ok_or(Errno::ENOENT)?;
-        let protect_metadata = sandbox.is_protected(ProtectionKind::Metadata, path, target_is_dir);
-        let protect_xattr = sandbox.is_protected(ProtectionKind::Xattr, path, target_is_dir);
-        drop(registry);
-        Ok((
-            bypass_metadata || bypass_xattr,
-            protect_metadata || protect_xattr,
-        ))
-    }
-
     fn authorize_xattr_read(
         &self,
         identity: RequestIdentity,
-        path: SandboxPath,
-        name: Option<String>,
+        operation: ReadWriteOperation,
     ) -> std::result::Result<ReadWriteDecision, Errno> {
-        let target_is_dir = self.path_is_directory(&path)?;
-        if self.path_matches_bypass(ProtectionKind::Xattr, &path, target_is_dir)? {
-            return Ok(ReadWriteDecision::Proceed);
-        }
-        let xattr_protected = {
-            let registry = self.registry.lock().unwrap();
-            let sandbox = registry
-                .sandboxes
-                .get(&self.sandbox_name)
-                .ok_or(Errno::ENOENT)?;
-            sandbox.is_protected(ProtectionKind::Xattr, &path, target_is_dir)
-        };
-        let operation = match (xattr_protected, name) {
-            (true, Some(name)) => ReadWriteOperation::GetXattr { path, name },
-            (true, None) => ReadWriteOperation::ListXattr { path },
-            (false, Some(name)) => ReadWriteOperation::GetXattrRead { path, name },
-            (false, None) => ReadWriteOperation::ListXattrRead { path },
-        };
         self.authorize_read_write(identity, operation)
     }
 
@@ -280,10 +239,6 @@ impl SandboxFs {
         name: &OsStr,
         remove: bool,
     ) -> std::result::Result<ReadWriteDecision, Errno> {
-        let target_is_dir = self.path_is_directory(&path)?;
-        if self.path_matches_bypass(ProtectionKind::Xattr, &path, target_is_dir)? {
-            return Ok(ReadWriteDecision::Proceed);
-        }
         let name = name.to_string_lossy().into_owned();
         let operation = if remove {
             ReadWriteOperation::RemoveXattr { path, name }
@@ -536,7 +491,16 @@ impl SandboxFs {
                 return Err(Errno::ENOENT);
             };
             let target_is_dir = sandbox.path_is_directory(&effect.path);
-            if sandbox.is_bypass(effect.kind, &effect.path, target_is_dir)
+            let xattr_operation = matches!(
+                operation,
+                ReadWriteOperation::GetXattr { .. }
+                    | ReadWriteOperation::ListXattr { .. }
+                    | ReadWriteOperation::SetXattr { .. }
+                    | ReadWriteOperation::RemoveXattr { .. }
+            );
+            if (xattr_operation
+                && sandbox.is_bypass(ProtectionKind::Xattr, &effect.path, target_is_dir))
+                || sandbox.is_bypass(effect.kind, &effect.path, target_is_dir)
                 || !sandbox.is_protected(effect.kind, &effect.path, target_is_dir)
             {
                 continue;
@@ -1280,55 +1244,9 @@ impl Filesystem for SandboxFs {
                 return;
             }
         }
-        let operation = MetadataOperation::SetXattr {
-            path: path.clone(),
-            name: name.to_string_lossy().into_owned(),
-        };
-        let (bypass, protected) = match self.xattr_mutation_bypassed_or_protected(&path) {
-            Ok(status) => status,
-            Err(err) => {
-                reply.error(err);
-                return;
-            }
-        };
-        if bypass {
-            match hostfs::setxattr(&local_path, name, value, flags) {
-                Ok(()) => reply.ok(),
-                Err(err) => reply.error(io_to_errno(err)),
-            }
-            return;
-        }
-        if !protected {
-            match hostfs::setxattr(&local_path, name, value, flags) {
-                Ok(()) => reply.ok(),
-                Err(err) => reply.error(io_to_errno(err)),
-            }
-            return;
-        }
-        match self.begin_metadata_request(RequestIdentity::from_request(req), path, operation) {
-            Ok(MetadataOutcome::Applied(_)) => {
-                match hostfs::setxattr(&local_path, name, value, flags) {
-                    Ok(()) => reply.ok(),
-                    Err(err) => reply.error(io_to_errno(err)),
-                }
-            }
-            Ok(MetadataOutcome::Pending(pending)) => {
-                let local_path = local_path.clone();
-                let name = name.to_os_string();
-                let value = value.to_vec();
-                std::thread::spawn(move || match wait_for_decision(&pending.waiter) {
-                    PendingDecision::Apply => {
-                        match hostfs::setxattr(&local_path, &name, &value, flags) {
-                            Ok(()) => reply.ok(),
-                            Err(err) => reply.error(io_to_errno(err)),
-                        }
-                    }
-                    PendingDecision::DoNothing => reply.ok(),
-                    PendingDecision::Deny => reply.error(Errno::EPERM),
-                    PendingDecision::Cancel => reply.error(Errno::ECANCELED),
-                });
-            }
-            Err(err) => reply.error(err),
+        match hostfs::setxattr(&local_path, name, value, flags) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(io_to_errno(err)),
         }
     }
     fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
@@ -1336,11 +1254,11 @@ impl Filesystem for SandboxFs {
             reply.error(Errno::ENOENT);
             return;
         };
-        match self.authorize_xattr_read(
-            RequestIdentity::from_request(req),
-            path,
-            Some(name.to_string_lossy().into_owned()),
-        ) {
+        let operation = ReadWriteOperation::GetXattr {
+            path: path.clone(),
+            name: name.to_string_lossy().into_owned(),
+        };
+        match self.authorize_xattr_read(RequestIdentity::from_request(req), operation) {
             Ok(ReadWriteDecision::Proceed) => {}
             Ok(ReadWriteDecision::Denied) => {
                 reply.error(Errno::EACCES);
@@ -1368,7 +1286,8 @@ impl Filesystem for SandboxFs {
             reply.error(Errno::ENOENT);
             return;
         };
-        match self.authorize_xattr_read(RequestIdentity::from_request(req), path, None) {
+        let operation = ReadWriteOperation::ListXattr { path: path.clone() };
+        match self.authorize_xattr_read(RequestIdentity::from_request(req), operation) {
             Ok(ReadWriteDecision::Proceed) => {}
             Ok(ReadWriteDecision::Denied) => {
                 reply.error(Errno::EACCES);
@@ -1416,50 +1335,9 @@ impl Filesystem for SandboxFs {
                 return;
             }
         }
-        let operation = MetadataOperation::RemoveXattr {
-            path: path.clone(),
-            name: name.to_string_lossy().into_owned(),
-        };
-        let (bypass, protected) = match self.xattr_mutation_bypassed_or_protected(&path) {
-            Ok(status) => status,
-            Err(err) => {
-                reply.error(err);
-                return;
-            }
-        };
-        if bypass {
-            match hostfs::removexattr(&local_path, name) {
-                Ok(()) => reply.ok(),
-                Err(err) => reply.error(io_to_errno(err)),
-            }
-            return;
-        }
-        if !protected {
-            match hostfs::removexattr(&local_path, name) {
-                Ok(()) => reply.ok(),
-                Err(err) => reply.error(io_to_errno(err)),
-            }
-            return;
-        }
-        match self.begin_metadata_request(RequestIdentity::from_request(req), path, operation) {
-            Ok(MetadataOutcome::Applied(_)) => match hostfs::removexattr(&local_path, name) {
-                Ok(()) => reply.ok(),
-                Err(err) => reply.error(io_to_errno(err)),
-            },
-            Ok(MetadataOutcome::Pending(pending)) => {
-                let local_path = local_path.clone();
-                let name = name.to_os_string();
-                std::thread::spawn(move || match wait_for_decision(&pending.waiter) {
-                    PendingDecision::Apply => match hostfs::removexattr(&local_path, &name) {
-                        Ok(()) => reply.ok(),
-                        Err(err) => reply.error(io_to_errno(err)),
-                    },
-                    PendingDecision::DoNothing => reply.ok(),
-                    PendingDecision::Deny => reply.error(Errno::EPERM),
-                    PendingDecision::Cancel => reply.error(Errno::ECANCELED),
-                });
-            }
-            Err(err) => reply.error(err),
+        match hostfs::removexattr(&local_path, name) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(io_to_errno(err)),
         }
     }
 

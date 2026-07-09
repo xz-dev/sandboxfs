@@ -214,9 +214,7 @@ impl ProtectionRuleResult {
 pub enum ReadWriteOperation {
     ReadFile { path: SandboxPath },
     ReadDirectory { path: SandboxPath },
-    GetXattrRead { path: SandboxPath, name: String },
     GetXattr { path: SandboxPath, name: String },
-    ListXattrRead { path: SandboxPath },
     ListXattr { path: SandboxPath },
     OpenWrite { path: SandboxPath },
     WriteFile { path: SandboxPath },
@@ -253,26 +251,30 @@ impl ReadWriteOperation {
                 path.clone(),
                 format!("path={path} READ directory"),
             )],
-            Self::GetXattrRead { path, name } => vec![ReadWriteEffect::new(
-                ProtectionKind::Read,
-                path.clone(),
-                format!("path={path} READ GETXATTR name={name}"),
-            )],
-            Self::GetXattr { path, name } => vec![ReadWriteEffect::new(
-                ProtectionKind::Xattr,
-                path.clone(),
-                format!("path={path} XATTR GETXATTR name={name}"),
-            )],
-            Self::ListXattrRead { path } => vec![ReadWriteEffect::new(
-                ProtectionKind::Read,
-                path.clone(),
-                format!("path={path} READ LISTXATTR"),
-            )],
-            Self::ListXattr { path } => vec![ReadWriteEffect::new(
-                ProtectionKind::Xattr,
-                path.clone(),
-                format!("path={path} XATTR LISTXATTR"),
-            )],
+            Self::GetXattr { path, name } => vec![
+                ReadWriteEffect::new(
+                    ProtectionKind::Read,
+                    path.clone(),
+                    format!("path={path} READ GETXATTR name={name}"),
+                ),
+                ReadWriteEffect::new(
+                    ProtectionKind::Xattr,
+                    path.clone(),
+                    format!("path={path} XATTR GETXATTR name={name}"),
+                ),
+            ],
+            Self::ListXattr { path } => vec![
+                ReadWriteEffect::new(
+                    ProtectionKind::Read,
+                    path.clone(),
+                    format!("path={path} READ LISTXATTR"),
+                ),
+                ReadWriteEffect::new(
+                    ProtectionKind::Xattr,
+                    path.clone(),
+                    format!("path={path} XATTR LISTXATTR"),
+                ),
+            ],
             Self::OpenWrite { path } => vec![ReadWriteEffect::new(
                 ProtectionKind::Write,
                 path.clone(),
@@ -283,16 +285,40 @@ impl ReadWriteOperation {
                 path.clone(),
                 format!("path={path} WRITE data"),
             )],
-            Self::SetXattr { path, name } => vec![ReadWriteEffect::new(
-                ProtectionKind::Write,
-                path.clone(),
-                format!("path={path} WRITE SETXATTR name={name}"),
-            )],
-            Self::RemoveXattr { path, name } => vec![ReadWriteEffect::new(
-                ProtectionKind::Write,
-                path.clone(),
-                format!("path={path} WRITE REMOVEXATTR name={name}"),
-            )],
+            Self::SetXattr { path, name } => vec![
+                ReadWriteEffect::new(
+                    ProtectionKind::Write,
+                    path.clone(),
+                    format!("path={path} WRITE SETXATTR name={name}"),
+                ),
+                ReadWriteEffect::new(
+                    ProtectionKind::Metadata,
+                    path.clone(),
+                    format!("path={path} METADATA SETXATTR name={name}"),
+                ),
+                ReadWriteEffect::new(
+                    ProtectionKind::Xattr,
+                    path.clone(),
+                    format!("path={path} XATTR SETXATTR name={name}"),
+                ),
+            ],
+            Self::RemoveXattr { path, name } => vec![
+                ReadWriteEffect::new(
+                    ProtectionKind::Write,
+                    path.clone(),
+                    format!("path={path} WRITE REMOVEXATTR name={name}"),
+                ),
+                ReadWriteEffect::new(
+                    ProtectionKind::Metadata,
+                    path.clone(),
+                    format!("path={path} METADATA REMOVEXATTR name={name}"),
+                ),
+                ReadWriteEffect::new(
+                    ProtectionKind::Xattr,
+                    path.clone(),
+                    format!("path={path} XATTR REMOVEXATTR name={name}"),
+                ),
+            ],
             Self::Truncate { path } => vec![
                 ReadWriteEffect::new(
                     ProtectionKind::Write,
@@ -366,9 +392,7 @@ impl ReadWriteOperation {
         match self {
             Self::ReadFile { path }
             | Self::ReadDirectory { path }
-            | Self::GetXattrRead { path, .. }
             | Self::GetXattr { path, .. }
-            | Self::ListXattrRead { path }
             | Self::ListXattr { path }
             | Self::OpenWrite { path }
             | Self::WriteFile { path }
@@ -400,12 +424,8 @@ impl ReadWriteOperation {
         match self {
             Self::ReadFile { path } => format!("path={path} READ file"),
             Self::ReadDirectory { path } => format!("path={path} READ directory"),
-            Self::GetXattrRead { path, name } => {
-                format!("path={path} READ GETXATTR name={name}")
-            }
-            Self::GetXattr { path, name } => format!("path={path} XATTR GETXATTR name={name}"),
-            Self::ListXattrRead { path } => format!("path={path} READ LISTXATTR"),
-            Self::ListXattr { path } => format!("path={path} XATTR LISTXATTR"),
+            Self::GetXattr { path, name } => format!("path={path} READ GETXATTR name={name}"),
+            Self::ListXattr { path } => format!("path={path} READ LISTXATTR"),
             Self::OpenWrite { path } => format!("path={path} WRITE open"),
             Self::WriteFile { path } => format!("path={path} WRITE data"),
             Self::SetXattr { path, name } => format!("path={path} WRITE SETXATTR name={name}"),
