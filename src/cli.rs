@@ -75,6 +75,9 @@ enum SandboxCommand {
     ProtectMetadata {
         pattern: String,
     },
+    ProtectXattr {
+        pattern: String,
+    },
     UnprotectRead {
         pattern: String,
     },
@@ -82,6 +85,9 @@ enum SandboxCommand {
         pattern: String,
     },
     UnprotectMetadata {
+        pattern: String,
+    },
+    UnprotectXattr {
         pattern: String,
     },
     BypassRead {
@@ -93,6 +99,9 @@ enum SandboxCommand {
     BypassMetadata {
         pattern: String,
     },
+    BypassXattr {
+        pattern: String,
+    },
     UnbypassRead {
         pattern: String,
     },
@@ -102,6 +111,9 @@ enum SandboxCommand {
     UnbypassMetadata {
         pattern: String,
     },
+    UnbypassXattr {
+        pattern: String,
+    },
     ListProtection {
         #[arg(long, action = ArgAction::SetTrue)]
         read: bool,
@@ -109,6 +121,8 @@ enum SandboxCommand {
         write: bool,
         #[arg(long, action = ArgAction::SetTrue)]
         metadata: bool,
+        #[arg(long, action = ArgAction::SetTrue)]
+        xattr: bool,
     },
     ListBypass {
         #[arg(long, action = ArgAction::SetTrue)]
@@ -117,6 +131,8 @@ enum SandboxCommand {
         write: bool,
         #[arg(long, action = ArgAction::SetTrue)]
         metadata: bool,
+        #[arg(long, action = ArgAction::SetTrue)]
+        xattr: bool,
     },
     Chmod {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -264,6 +280,12 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
             ProtectionKind::Metadata,
             PolicyPattern::new(pattern)?,
         ),
+        SandboxCommand::ProtectXattr { pattern } => protect(
+            runtime,
+            &name,
+            ProtectionKind::Xattr,
+            PolicyPattern::new(pattern)?,
+        ),
         SandboxCommand::UnprotectRead { pattern } => unprotect(
             runtime,
             &name,
@@ -280,6 +302,12 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
             runtime,
             &name,
             ProtectionKind::Metadata,
+            PolicyPattern::new(pattern)?,
+        ),
+        SandboxCommand::UnprotectXattr { pattern } => unprotect(
+            runtime,
+            &name,
+            ProtectionKind::Xattr,
             PolicyPattern::new(pattern)?,
         ),
         SandboxCommand::BypassRead { pattern } => bypass(
@@ -300,6 +328,12 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
             ProtectionKind::Metadata,
             PolicyPattern::new(pattern)?,
         ),
+        SandboxCommand::BypassXattr { pattern } => bypass(
+            runtime,
+            &name,
+            ProtectionKind::Xattr,
+            PolicyPattern::new(pattern)?,
+        ),
         SandboxCommand::UnbypassRead { pattern } => unbypass(
             runtime,
             &name,
@@ -318,10 +352,17 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
             ProtectionKind::Metadata,
             PolicyPattern::new(pattern)?,
         ),
+        SandboxCommand::UnbypassXattr { pattern } => unbypass(
+            runtime,
+            &name,
+            ProtectionKind::Xattr,
+            PolicyPattern::new(pattern)?,
+        ),
         SandboxCommand::ListProtection {
             read,
             write,
             metadata,
+            xattr,
         } => print_response(send(
             runtime,
             &name,
@@ -330,12 +371,14 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
                 include_read: read,
                 include_write: write,
                 include_metadata: metadata,
+                include_xattr: xattr,
             },
         )?),
         SandboxCommand::ListBypass {
             read,
             write,
             metadata,
+            xattr,
         } => print_response(send(
             runtime,
             &name,
@@ -344,6 +387,7 @@ fn run_sandbox(runtime: &RuntimePaths, cli: SandboxCli) -> Result<i32> {
                 include_read: read,
                 include_write: write,
                 include_metadata: metadata,
+                include_xattr: xattr,
             },
         )?),
         SandboxCommand::Chmod { args } => run_trusted_command(runtime, &name, "chmod", args),

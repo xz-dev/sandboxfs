@@ -160,13 +160,27 @@ impl SessionState {
                 include_read,
                 include_write,
                 include_metadata,
-            } => self.list_protection(&name, include_read, include_write, include_metadata),
+                include_xattr,
+            } => self.list_protection(
+                &name,
+                include_read,
+                include_write,
+                include_metadata,
+                include_xattr,
+            ),
             Request::ListBypass {
                 name,
                 include_read,
                 include_write,
                 include_metadata,
-            } => self.list_bypass(&name, include_read, include_write, include_metadata),
+                include_xattr,
+            } => self.list_bypass(
+                &name,
+                include_read,
+                include_write,
+                include_metadata,
+                include_xattr,
+            ),
             Request::ListMounts { name } => self.list_mounts(&name),
             Request::Metadata { name } => self.metadata(&name),
             Request::BeginTrustedOperation {
@@ -508,6 +522,7 @@ impl SessionState {
         include_read: bool,
         include_write: bool,
         include_metadata: bool,
+        include_xattr: bool,
     ) -> Result<Response> {
         let registry = self.registry.lock().unwrap();
         let sandbox = registry
@@ -515,7 +530,12 @@ impl SessionState {
             .get(name)
             .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
         Ok(Response::ProtectionRules {
-            items: sandbox.protection_rules(include_read, include_write, include_metadata),
+            items: sandbox.protection_rules(
+                include_read,
+                include_write,
+                include_metadata,
+                include_xattr,
+            ),
         })
     }
 
@@ -525,6 +545,7 @@ impl SessionState {
         include_read: bool,
         include_write: bool,
         include_metadata: bool,
+        include_xattr: bool,
     ) -> Result<Response> {
         let registry = self.registry.lock().unwrap();
         let sandbox = registry
@@ -532,7 +553,12 @@ impl SessionState {
             .get(name)
             .ok_or_else(|| Error::msg(format!("sandbox not found: {name}")))?;
         Ok(Response::BypassRules {
-            items: sandbox.bypass_rules(include_read, include_write, include_metadata),
+            items: sandbox.bypass_rules(
+                include_read,
+                include_write,
+                include_metadata,
+                include_xattr,
+            ),
         })
     }
 

@@ -67,12 +67,14 @@ pub enum Request {
         include_read: bool,
         include_write: bool,
         include_metadata: bool,
+        include_xattr: bool,
     },
     ListBypass {
         name: String,
         include_read: bool,
         include_write: bool,
         include_metadata: bool,
+        include_xattr: bool,
     },
     ListMounts {
         name: String,

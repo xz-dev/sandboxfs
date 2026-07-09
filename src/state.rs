@@ -39,6 +39,7 @@ pub enum ProtectionKind {
     Read,
     Write,
     Metadata,
+    Xattr,
 }
 
 impl ProtectionKind {
@@ -47,6 +48,7 @@ impl ProtectionKind {
             Self::Read => "READ",
             Self::Write => "WRITE",
             Self::Metadata => "METADATA",
+            Self::Xattr => "XATTR",
         }
     }
 }
@@ -1191,11 +1193,13 @@ impl Sandbox {
         include_read: bool,
         include_write: bool,
         include_metadata: bool,
+        include_xattr: bool,
     ) -> Vec<ProtectionRule> {
-        let include_all = !include_read && !include_write && !include_metadata;
+        let include_all = !include_read && !include_write && !include_metadata && !include_xattr;
         let include_read = include_read || include_all;
         let include_write = include_write || include_all;
         let include_metadata = include_metadata || include_all;
+        let include_xattr = include_xattr || include_all;
         let mut rules: Vec<ProtectionRule> = self
             .protection_rules
             .iter()
@@ -1203,6 +1207,7 @@ impl Sandbox {
                 ProtectionKind::Read => include_read,
                 ProtectionKind::Write => include_write,
                 ProtectionKind::Metadata => include_metadata,
+                ProtectionKind::Xattr => include_xattr,
             })
             .cloned()
             .collect();
@@ -1219,11 +1224,13 @@ impl Sandbox {
         include_read: bool,
         include_write: bool,
         include_metadata: bool,
+        include_xattr: bool,
     ) -> Vec<BypassRule> {
-        let include_all = !include_read && !include_write && !include_metadata;
+        let include_all = !include_read && !include_write && !include_metadata && !include_xattr;
         let include_read = include_read || include_all;
         let include_write = include_write || include_all;
         let include_metadata = include_metadata || include_all;
+        let include_xattr = include_xattr || include_all;
         let mut rules: Vec<BypassRule> = self
             .bypass_rules
             .iter()
@@ -1231,6 +1238,7 @@ impl Sandbox {
                 ProtectionKind::Read => include_read,
                 ProtectionKind::Write => include_write,
                 ProtectionKind::Metadata => include_metadata,
+                ProtectionKind::Xattr => include_xattr,
             })
             .cloned()
             .collect();
@@ -2191,7 +2199,7 @@ mod tests {
         s.protect(ProtectionKind::Read, SandboxPath::new("/b").unwrap());
         s.protect(ProtectionKind::Read, SandboxPath::new("/a").unwrap());
 
-        let all = s.protection_rules(false, false, false);
+        let all = s.protection_rules(false, false, false, false);
         assert_eq!(
             all.iter()
                 .map(|rule| (rule.kind, rule.pattern.to_string()))
@@ -2204,9 +2212,9 @@ mod tests {
             ]
         );
 
-        assert_eq!(s.protection_rules(true, false, false).len(), 2);
-        assert_eq!(s.protection_rules(false, true, false).len(), 2);
-        assert_eq!(s.protection_rules(true, true, false), all);
+        assert_eq!(s.protection_rules(true, false, false, false).len(), 2);
+        assert_eq!(s.protection_rules(false, true, false, false).len(), 2);
+        assert_eq!(s.protection_rules(true, true, false, false), all);
     }
 
     #[test]

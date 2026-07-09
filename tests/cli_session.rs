@@ -106,6 +106,11 @@ fn protection_rule_commands_log_outcomes_and_list_sorted_filters_without_logging
         .success();
     session
         .sandbox_cmd()
+        .args(["protect-xattr", "/x/**"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
         .args(["protect-read", "/a"])
         .assert()
         .success();
@@ -120,7 +125,7 @@ fn protection_rule_commands_log_outcomes_and_list_sorted_filters_without_logging
         .arg("list-protection")
         .assert()
         .success()
-        .stdout("READ /a\nWRITE /a\nWRITE /b\nMETADATA /m/\n");
+        .stdout("READ /a\nWRITE /a\nWRITE /b\nMETADATA /m/\nXATTR /x/**\n");
     session
         .sandbox_cmd()
         .args(["list-protection", "--read"])
@@ -141,11 +146,16 @@ fn protection_rule_commands_log_outcomes_and_list_sorted_filters_without_logging
         .stdout("METADATA /m/\n");
     session
         .sandbox_cmd()
+        .args(["list-protection", "--xattr"])
+        .assert()
+        .success()
+        .stdout("XATTR /x/**\n");
+    session
+        .sandbox_cmd()
         .args(["list-protection", "--read", "--write"])
         .assert()
         .success()
         .stdout("READ /a\nWRITE /a\nWRITE /b\n");
-
     let log_path = session.log_dir().join(format!("{}.log", session.name));
     let log_before_list = fs::read_to_string(&log_path).unwrap();
     session
@@ -160,6 +170,7 @@ fn protection_rule_commands_log_outcomes_and_list_sorted_filters_without_logging
     assert!(log_before_list.contains("protect kind=WRITE pattern=/a result=added"));
     assert!(log_before_list.contains("protect kind=METADATA pattern=/m/ result=added"));
     assert!(log_before_list.contains("protect kind=READ pattern=/a result=already-present"));
+    assert!(log_before_list.contains("protect kind=XATTR pattern=/x/** result=added"));
     assert!(log_before_list.contains("unprotect kind=READ pattern=/missing result=not-present"));
 }
 
@@ -189,6 +200,11 @@ fn bypass_rule_commands_log_outcomes_and_list_sorted_filters_without_logging() {
         .success();
     session
         .sandbox_cmd()
+        .args(["bypass-xattr", "/x/file"])
+        .assert()
+        .success();
+    session
+        .sandbox_cmd()
         .args(["bypass-read", "/a"])
         .assert()
         .success();
@@ -203,7 +219,7 @@ fn bypass_rule_commands_log_outcomes_and_list_sorted_filters_without_logging() {
         .arg("list-bypass")
         .assert()
         .success()
-        .stdout("READ /a\nWRITE /a\nWRITE /b\nMETADATA /m/\n");
+        .stdout("READ /a\nWRITE /a\nWRITE /b\nMETADATA /m/\nXATTR /x/file\n");
     session
         .sandbox_cmd()
         .args(["list-bypass", "--read"])
@@ -224,11 +240,16 @@ fn bypass_rule_commands_log_outcomes_and_list_sorted_filters_without_logging() {
         .stdout("METADATA /m/\n");
     session
         .sandbox_cmd()
+        .args(["list-bypass", "--xattr"])
+        .assert()
+        .success()
+        .stdout("XATTR /x/file\n");
+    session
+        .sandbox_cmd()
         .args(["list-bypass", "--read", "--write"])
         .assert()
         .success()
         .stdout("READ /a\nWRITE /a\nWRITE /b\n");
-
     let log_path = session.log_dir().join(format!("{}.log", session.name));
     let log_before_list = fs::read_to_string(&log_path).unwrap();
     session.sandbox_cmd().arg("list-bypass").assert().success();
@@ -240,6 +261,7 @@ fn bypass_rule_commands_log_outcomes_and_list_sorted_filters_without_logging() {
     assert!(log_before_list.contains("bypass kind=METADATA pattern=/m/ result=added"));
     assert!(log_before_list.contains("bypass kind=READ pattern=/a result=already-present"));
     assert!(log_before_list.contains("unbypass kind=READ pattern=/missing result=not-present"));
+    assert!(log_before_list.contains("bypass kind=XATTR pattern=/x/file result=added"));
 }
 
 #[test]
